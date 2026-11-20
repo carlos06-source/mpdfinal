@@ -37,7 +37,6 @@ from sklearn.preprocessing import StandardScaler
 st.set_page_config(page_title="MPD · Pizzería: Elasticidad + Demanda + Inventario",
                    page_icon="🍕", layout="wide")
 
-DATA_FILE = "pizza_sales_ordenado.csv"
 PALETA = ["#C1272D", "#F4A300", "#6B8E23", "#8B4513", "#F5D061"]
 COLOR_BASE, COLOR_ESC = "#7A2E0E", "#C1272D"
 
@@ -45,6 +44,7 @@ VARIABLES = ["precio", "semana", "mes", "t", "sin_doy", "cos_doy",
              "lag_1", "lag_2", "lag_3", "lag_4", "media_4"]
 Z_TABLA = {"90 %": 1.282, "95 %": 1.645, "97.5 %": 1.960, "99 %": 2.326}
 OPC_TOP5 = "Top 5 agregado"
+OPC_TODAS = "Todas las pizzas (pizzería completa)"
 M_RF, M_PCA = "Random Forest (propuesto)", "Random Forest + PCA"
 M_NAIVE, M_MA4 = "Ingenuo (última semana)", "Media móvil 4 semanas"
 M_AUTO = "Automático (menor MAPE en backtesting)"
@@ -114,27 +114,17 @@ def _leer_csv(texto: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Cargando datos…")
-def cargar_desde_ruta(ruta: str, firma: float) -> pd.DataFrame:
-    return _leer_csv(Path(ruta).read_text(encoding="utf-8-sig", errors="replace"))
-
-
-@st.cache_data(show_spinner="Cargando datos…")
 def cargar_desde_bytes(contenido: bytes) -> pd.DataFrame:
     return _leer_csv(contenido.decode("utf-8-sig", errors="replace"))
 
 
 def obtener_datos(subido) -> pd.DataFrame:
+    """Solo se trabaja con el archivo que carga el usuario (no hay datos precargados)."""
     try:
-        if subido is not None:
-            return cargar_desde_bytes(subido.getvalue())
-        ruta = Path(__file__).resolve().parent / DATA_FILE
-        if ruta.exists():
-            return cargar_desde_ruta(str(ruta), ruta.stat().st_mtime)
+        return cargar_desde_bytes(subido.getvalue())
     except Exception as exc:  # noqa: BLE001
         st.error(f"No se pudo leer el CSV: {exc}")
         st.stop()
-    st.error(f"No se encontró «{DATA_FILE}» junto a app.py. Súbalo desde el panel lateral (📂 Datos).")
-    st.stop()
 
 
 # ----------------------------------------------------------------------------
@@ -346,9 +336,18 @@ def crear_features(serie: pd.DataFrame) -> pd.DataFrame:
     return out.dropna().reset_index(drop=True)
 
 
+def filtrar_alcance(df: pd.DataFrame, productos: tuple, seleccion: str) -> pd.DataFrame:
+    """Mismo subconjunto de pizzas para pronóstico, ingreso e inventario."""
+    if seleccion == OPC_TODAS:
+        return df
+    if seleccion == OPC_TOP5:
+        return df[df["pizza_name"].isin(productos)]
+    return df[df["pizza_name"] == seleccion]
+
+
 @st.cache_data(show_spinner=False)
-def preparar_serie(_df, clave: str, productos: tuple, seleccion: str):
-    d = _df[_df["pizza_name"].isin(productos)] if seleccion == OPC_TOP5 else _df[_df["pizza_name"] == seleccion]
+def preparar_serie(_d, clave_s: str):
+    d = _d
     serie, n_desc, n_ajust = agregar_semanal(d)
     feat = crear_features(serie)
     pu = d.groupby("pizza_category")["quantity"].sum()
@@ -505,14 +504,20 @@ def simular_ciclo(media, ROP, EOQ, SS, L, dias_sim=120):
 
 
 # ----------------------------------------------------------------------------
-# 5. PANEL LATERAL: PARÁMETROS GLOBALES (alimentan a los tres modelos)
+# 5. CARGA DE DATOS (la app NO trae datos: todo aparece al cargar el CSV)
 # ----------------------------------------------------------------------------
 st.title("🍕 Pizzería · Elasticidad + Demanda + Inventario")
-st.caption("MPD · Grupo 2 — Modelos conectados: el precio mueve la demanda y la demanda mueve el inventario.")
+st.caption("MPD · Grupo 2 — Un solo sistema: el precio mueve la demanda, la demanda mueve el inventario, "
+           "y el inventario (servicio y costos) vuelve sobre las ventas, el margen y el precio óptimo.")
 
 st.sidebar.title("🎛️ Panel de control")
-with st.sidebar.expander("📂 Datos", expanded=False):
-    subido = st.file_uploader("Reemplazar CSV (opcional, separador ; o ,)", type=["csv"])
+subido = st.sidebar.file_uploader("📂 Cargar CSV de ventas (separador ; o ,)", type=["csv"])
+if subido is None:
+    st.info("👈 **Cargue el archivo de ventas** (pizza_sales) en el panel lateral para iniciar el análisis. "
+            "La aplicación no trae datos precargados: todos los modelos se calculan a partir del archivo cargado.")
+    st.markdown("**Columnas requeridas:** " + ", ".join(f"`{c}`" for c in COLUMNAS_REQ) +
+                ". Fechas en formato día/mes/año.")
+    st.stop()
 df = obtener_datos(subido)
 clave = f"{len(df)}-{df['total_price'].sum():.2f}"
 CATS = sorted(df["pizza_category"].unique())
@@ -522,6 +527,9 @@ ols_g, tabla_cat, tabla_tam = modelo_global_y_segmentos(agg, clave)
 top5 = calcular_top5(df, clave)
 productos_top5 = tuple(top5.index.tolist())
 
+# ----------------------------------------------------------------------------
+# 6. PANEL LATERAL: PARÁMETROS (cada uno alimenta a todo el sistema)
+# ----------------------------------------------------------------------------
 st.sidebar.subheader("💲 1 · Escenario de precios")
 delta_global = st.sidebar.slider("Cambio de precio global (%)", -30, 30, 0, 1)
 extra = {}
@@ -534,9 +542,13 @@ modo = st.sidebar.selectbox("Elasticidad a utilizar",
 eps_manual = st.sidebar.slider("ε manual", -3.0, -0.05, -1.0, 0.05, disabled=(modo != "Manual"))
 forzar = st.sidebar.checkbox("Si la categoría no es identificable o ε ≥ 0, usar la global", value=True)
 aplicar_precio = st.sidebar.checkbox("Propagar el precio a demanda e inventario", value=True)
+if all(v == 0 for v in deltas.values()):
+    st.sidebar.caption("Con Δ precio = 0 % la elasticidad no cambia el escenario actual, "
+                       "pero sí la curva de sensibilidad y el precio óptimo.")
 
 st.sidebar.subheader("📈 2 · Demanda (series de tiempo)")
-serie_sel = st.sidebar.selectbox("Serie a pronosticar", [OPC_TOP5] + list(productos_top5))
+serie_sel = st.sidebar.selectbox("Alcance / serie a pronosticar", [OPC_TOP5, OPC_TODAS] + list(productos_top5),
+                                 help="Define qué pizzas entran en el pronóstico Y en el inventario (mismo alcance).")
 modelo_sel = st.sidebar.selectbox("Modelo de pronóstico", [M_AUTO, M_RF, M_PCA])
 horizonte = st.sidebar.slider("Horizonte (semanas)", 4, 12, 8)
 n_est = st.sidebar.slider("Árboles del Random Forest", 100, 500, 300, 50)
@@ -545,57 +557,97 @@ aplicar_pron = st.sidebar.checkbox("Propagar el pronóstico al inventario", valu
 st.sidebar.subheader("📦 3 · Inventario (revisión continua)")
 top_n = st.sidebar.slider("N.º de insumos principales", 5, 15, 10)
 L = st.sidebar.number_input("Lead time L (días)", 1, 30, 2)
-nivel = st.sidebar.selectbox("Nivel de servicio", list(Z_TABLA.keys()), index=1)
+nivel = st.sidebar.selectbox("Nivel de servicio (ciclo)", list(Z_TABLA.keys()), index=1)
 Z = Z_TABLA[nivel]
 S_ped = st.sidebar.number_input("Costo por pedido S (S/)", 1.0, 1000.0, 45.0, 1.0)
 H_men = st.sidebar.number_input("Costo de mantener H (S/ por porción-año)", 0.1, 50.0, 1.0, 0.1)
 dias_anio = st.sidebar.number_input("Días del año comercial", 300, 366, 365)
+
+st.sidebar.subheader("💵 4 · Economía del escenario")
+cv = st.sidebar.slider("Costo de insumos por pizza (% del precio actual)", 0, 80, 30, 1,
+                       help="Supuesto (el dataset no trae costos). Se fija en US$ por pizza: no cambia al mover el precio.")
 tc = st.sidebar.number_input("Tipo de cambio (S/ por US$, supuesto)", 1.0, 10.0, 3.70, 0.01,
-                             help="Las ventas del dataset están en US$; S y H están en soles. "
-                                  "Se usa para expresar ambos en la misma moneda.")
+                             help="Ventas en US$ (moneda del dataset); S y H en soles. Convierte todo a una sola moneda.")
 
 # ----------------------------------------------------------------------------
-# 6. CÁLCULO ENCADENADO (Elasticidad → Demanda → Inventario)
+# 7. MOTOR INTEGRADO: Precio ⇄ Demanda ⇄ Inventario ⇄ Margen
 # ----------------------------------------------------------------------------
 eps, respaldo = construir_elasticidades(modo, eps_manual, forzar, ols_g["eps"], tabla_cat, CATS)
 cero = {c: 0.0 for c in CATS}
 d_efectivos = deltas if aplicar_precio else cero
 
-# --- Demanda
-serie, df_feat, (n_desc, n_ajust), pes_u, pes_r, precio_unit, d_ser = preparar_serie(
-    df, clave, productos_top5, serie_sel)
-# Backtesting de los 4 modelos ANTES de elegir: así el modo automático usa el de menor error
+# --- Alcance común: las MISMAS pizzas para demanda, ingreso e inventario
+d_scope = filtrar_alcance(df, productos_top5, serie_sel)
+clave_s = f"{clave}|{serie_sel}"
+cats_scope = sorted(d_scope["pizza_category"].unique())
+
+# --- Demanda (series de tiempo)
+serie, df_feat, (n_desc, n_ajust), pes_u, pes_r, precio_unit, d_ser = preparar_serie(d_scope, clave_s)
 bt_res = {n: backtest(df_feat, n, n_est) for n in [M_NAIVE, M_MA4, M_RF, M_PCA]}
-if modelo_sel == M_AUTO:
-    modelo_usado = min([M_RF, M_PCA], key=lambda n: bt_res[n][2])
-else:
-    modelo_usado = modelo_sel
+modelo_usado = min([M_RF, M_PCA], key=lambda n: bt_res[n][2]) if modelo_sel == M_AUTO else modelo_sel
 mejor_global = min(bt_res, key=lambda n: bt_res[n][2])
 modelo_fit = ajustar_modelo(df_feat, modelo_usado, n_est)
 fc = pronosticar(df_feat, modelo_fit, horizonte)
 media_hist = float(serie["unidades"].mean())
 g_pron = float(fc["prediccion"].mean() / media_hist) if aplicar_pron else 1.0
-m_unid_serie = mult_demanda(pes_u, d_efectivos, eps, 0.0)
-m_ing_serie = mult_demanda(pes_r, d_efectivos, eps, 1.0)
-fc["escenario"] = (fc["prediccion"] * m_unid_serie).round(1)
-fc["ingreso_base"] = fc["prediccion"] * precio_unit
-fc["ingreso_escenario"] = fc["ingreso_base"] * m_ing_serie
+pron_total = float(fc["prediccion"].sum())
 
-# --- Inventario
-consumo, shares = preparar_insumos(df, clave, top_n)
+# --- Inventario (insumos del mismo alcance)
+consumo, shares = preparar_insumos(d_scope, clave_s, top_n)
 est = estadisticos_base(consumo)
-m_insumo = mult_insumos(shares, d_efectivos, eps)
-factor_esc = g_pron * m_insumo
-# Tres niveles, con UNA sola definición de "base" en toda la app:
-#   histórico  = consumo observado 2015 (factor 1)
-#   base       = pronóstico con el precio actual (factor g)   ← todas las variaciones "vs base"
-#   escenario  = pronóstico × efecto del precio (factor g · m)
 met_hist = metricas_inventario(est, 1.0, Z, L, S_ped, H_men, dias_anio)
-met_base = metricas_inventario(est, g_pron, Z, L, S_ped, H_men, dias_anio)
-met_esc = metricas_inventario(est, factor_esc, Z, L, S_ped, H_men, dias_anio)
+
+G_Z = float(stats.norm.pdf(Z) - Z * stats.norm.sf(Z))  # función de pérdida normal estándar G(z)
+frac_h = 7 * horizonte / dias_anio                     # fracción del año que cubre el horizonte
+costo_pizza = cv / 100.0 * precio_unit                 # US$ por pizza (fijo)
+
+
+def evaluar(dd: dict) -> dict:
+    """Un escenario completo, con todas las unidades llevadas al MISMO horizonte y a US$."""
+    m_u = mult_demanda(pes_u, dd, eps, 0.0)            # precio → unidades
+    m_r = mult_demanda(pes_r, dd, eps, 1.0)            # precio → ingreso
+    m_i = mult_insumos(shares, dd, eps)                # precio → consumo de cada insumo
+    fac = g_pron * m_i                                 # pronóstico × precio → insumos
+    met = metricas_inventario(est, fac, Z, L, S_ped, H_men, dias_anio)
+    # inventario → ventas: faltante esperado por ciclo = σ_L·G(z); fill rate = 1 − faltante / Q
+    faltante = est["Desv_Std"] * fac * np.sqrt(L) * G_Z
+    fill_i = (1 - faltante / met["EOQ"].where(met["EOQ"] > 0)).clip(0, 1).fillna(1.0)
+    w = met["Demanda_diaria"] / met["Demanda_diaria"].sum()
+    fill = float((w * fill_i).sum())
+    dem = pron_total * m_u
+    vend = dem * fill
+    ingreso = pron_total * precio_unit * m_r * fill
+    c_ins = costo_pizza * vend
+    c_inv_s = float(met["Costo_con_SS"].sum()) * frac_h
+    c_inv = c_inv_s / tc
+    return {"m_u": m_u, "m_r": m_r, "m_i": m_i, "fac": fac, "met": met, "fill_i": fill_i, "fill": fill,
+            "dem": dem, "vend": vend, "perdidas": dem - vend, "ingreso": ingreso, "c_ins": c_ins,
+            "c_inv": c_inv, "c_inv_s": c_inv_s, "margen": ingreso - c_ins - c_inv}
+
+
+R = evaluar(d_efectivos)   # escenario actual
+B = evaluar(cero)          # base: mismo pronóstico e inventario, precio sin cambio
+# Precio óptimo por MARGEN: aquí el inventario (S, H, L, servicio) y los costos vuelven sobre el precio
+sens = pd.DataFrame([{"d": d, **{k: v for k, v in evaluar(
+    {c: float(np.clip(d + extra[c], -90, 200)) for c in CATS}).items() if np.isscalar(v)}}
+    for d in range(-30, 31, 5)])
+opt = sens.loc[sens["margen"].idxmax()]
+
+# alias usados por las pestañas de detalle
+m_unid_serie, m_insumo, factor_esc = R["m_u"], R["m_i"], R["fac"]
+met_base, met_esc = B["met"], R["met"]
+fc["escenario"] = (fc["prediccion"] * R["m_u"]).round(1)
+fc["vendidas"] = (fc["escenario"] * R["fill"]).round(1)
+fc["ingreso_base"] = fc["prediccion"] * precio_unit * B["fill"]
+fc["ingreso_escenario"] = fc["prediccion"] * precio_unit * R["m_r"] * R["fill"]
+
+
+def pct(a, b):
+    return f"{(a / b - 1) * 100:+.1f} % vs base" if b else "—"
+
 
 # ----------------------------------------------------------------------------
-# 7. INTERFAZ
+# 8. INTERFAZ
 # ----------------------------------------------------------------------------
 tab_panel, tab_dem, tab_el, tab_inv, tab_met = st.tabs(
     ["🧭 Panel integrado", "📈 Demanda (series de tiempo)", "💲 Elasticidad de precios",
@@ -603,85 +655,101 @@ tab_panel, tab_dem, tab_el, tab_inv, tab_met = st.tabs(
 
 # ============================ PANEL INTEGRADO ================================
 with tab_panel:
-    st.header("Panel integrado: un solo escenario, tres modelos")
+    st.header("Panel integrado: un solo escenario, tres modelos conectados")
     st.markdown(
-        "**Flujo de la app:** `Precio (Δ%) × Elasticidad (ε)` → **multiplicador de demanda** → "
-        "`Pronóstico de series de tiempo` fija el nivel esperado (**factor g**) → "
-        "**consumo de insumos** → `SS, ROP, EOQ y costo anual`. "
-        "Modifique cualquier parámetro del panel lateral y todo lo que sigue en la cadena se recalcula."
+        "**Ciclo del sistema:** precio × elasticidad → demanda · pronóstico (g) → consumo de insumos → "
+        "SS, ROP, EOQ → **nivel de servicio real y ventas perdidas** → ingreso, costos y **margen** → "
+        "**precio óptimo**. Todo se mide en el mismo horizonte "
+        f"(**{horizonte} semanas**), en pizzas, porciones y US$."
     )
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Δ precio global", f"{delta_global:+d} %", help="Panel lateral, sección 1")
-    c2.metric("Elasticidad usada (media ponderada)", f"{sum(pes_u[c] * eps[c] for c in pes_u.index):.2f}")
-    c3.metric("Multiplicador de demanda (precio)", f"×{m_unid_serie:.3f}", f"{(m_unid_serie - 1) * 100:+.1f} %")
-    c4.metric("Factor de pronóstico g", f"×{g_pron:.3f}", f"{(g_pron - 1) * 100:+.1f} %",
-              help="Pronóstico medio semanal ÷ media semanal histórica de la serie seleccionada")
+    if set(CATS) - set(cats_scope):
+        st.caption(f"Alcance actual: {serie_sel} (categorías {', '.join(cats_scope)}). Los ajustes de precio de "
+                   f"{', '.join(sorted(set(CATS) - set(cats_scope)))} no afectan este alcance; elija «{OPC_TODAS}» "
+                   "para incluir todas las categorías.")
 
-    ing_b, ing_e = fc["ingreso_base"].sum(), fc["ingreso_escenario"].sum()
+    st.markdown("##### 1 · Precio y demanda")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Δ precio global", f"{delta_global:+d} %")
+    c2.metric("Elasticidad usada (media ponderada)", f"{sum(pes_u[c] * eps[c] for c in pes_u.index):.2f}")
+    c3.metric("Multiplicador de demanda (precio)", f"×{R['m_u']:.3f}", f"{(R['m_u'] - 1) * 100:+.1f} %")
+    c4.metric("Factor de pronóstico g", f"×{g_pron:.3f}", f"{(g_pron - 1) * 100:+.1f} % vs histórico",
+              help="Pronóstico medio semanal ÷ media semanal histórica del alcance")
+
+    st.markdown("##### 2 · Inventario y servicio")
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric(f"Unidades proyectadas ({horizonte} sem.)", f"{fc['escenario'].sum():,.0f}",
-              f"{(fc['escenario'].sum() / fc['prediccion'].sum() - 1) * 100:+.1f} % vs base")
-    c6.metric(f"Ingreso proyectado ({horizonte} sem.)", f"${ing_e:,.0f}", f"{(ing_e / ing_b - 1) * 100:+.1f} % vs base")
-    cb, ce = met_base["Costo_EOQ"].sum(), met_esc["Costo_EOQ"].sum()
-    c7.metric("Costo anual de inventario (Σ insumos)", f"S/ {ce:,.0f}", f"{(ce / cb - 1) * 100:+.1f} % vs base",
-              delta_color="inverse")
-    rb, re_ = met_base["ROP"].sum(), met_esc["ROP"].sum()
-    c8.metric("Σ Puntos de reorden", f"{re_:,.0f}", f"{(re_ / rb - 1) * 100:+.1f} % vs base", delta_color="inverse")
-    ch = met_hist["Costo_EOQ"].sum()
-    st.caption(
-        f"**Base** = pronóstico de series de tiempo con el precio actual (Δ precio = 0 %); todas las variaciones se miden "
-        f"contra ella. Frente al consumo histórico 2015, la base ya implica {(cb / ch - 1) * 100:+.1f} % en costo de "
-        f"inventario (efecto de g). Costo de inventario ≈ **US$ {ce / tc:,.0f}** · ingreso proyectado ≈ "
-        f"**S/ {ing_e * tc:,.0f}** (tipo de cambio supuesto S/ {tc:.2f} por US$)."
-    )
+    c5.metric(f"Demanda proyectada ({horizonte} sem.)", f"{R['dem']:,.0f} pizzas", pct(R["dem"], B["dem"]))
+    c6.metric("Fill rate (demanda atendida)", f"{R['fill'] * 100:.2f} %",
+              f"{R['perdidas']:,.1f} pizzas perdidas", delta_color="off",
+              help="1 − faltante esperado por ciclo (σ·√L·G(z)) ÷ lote EOQ, ponderado por consumo de insumos")
+    c7.metric(f"Costo de inventario ({horizonte} sem.)", f"US$ {R['c_inv']:,.0f}", pct(R["c_inv"], B["c_inv"]),
+              delta_color="inverse", help=f"S/ {R['c_inv_s']:,.0f} · pedidos + mantener lote + stock de seguridad")
+    c8.metric("Σ Puntos de reorden", f"{R['met']['ROP'].sum():,.0f} porc.",
+              pct(R["met"]["ROP"].sum(), B["met"]["ROP"].sum()), delta_color="inverse")
+
+    st.markdown("##### 3 · Resultado económico")
+    c9, c10, c11, c12 = st.columns(4)
+    c9.metric(f"Ingreso ({horizonte} sem.)", f"US$ {R['ingreso']:,.0f}", pct(R["ingreso"], B["ingreso"]),
+              help=f"≈ S/ {R['ingreso'] * tc:,.0f}")
+    c10.metric("Costo de insumos", f"US$ {R['c_ins']:,.0f}", pct(R["c_ins"], B["c_ins"]), delta_color="inverse")
+    c11.metric("Margen (ingreso − insumos − inventario)", f"US$ {R['margen']:,.0f}", pct(R["margen"], B["margen"]))
+    c12.metric("Δ precio que maximiza el margen", f"{opt['d']:+.0f} %",
+               f"margen US$ {opt['margen']:,.0f}", delta_color="off")
+    if opt["d"] in (sens["d"].min(), sens["d"].max()):
+        st.warning("El precio óptimo cae en el **borde** del rango (±30 %): con demanda inelástica el modelo siempre "
+                   "sugiere subir. No incluye competencia ni caídas no lineales de la demanda; úselo como escenario.")
 
     cA, cB = st.columns([3, 2])
     with cA:
-        st.subheader("Demanda semanal: histórico, pronóstico base y escenario")
+        st.subheader("Demanda semanal: histórico, base y escenario")
         hist = df_feat[["fecha", "unidades"]].tail(16)
         fig, ax = plt.subplots(figsize=(8.5, 3.8))
         ax.plot(hist["fecha"], hist["unidades"], marker="o", color=COLOR_BASE, label="Histórico")
-        ax.plot(fc["fecha"], fc["prediccion"], marker="o", ls="--", color="#F4A300", label="Pronóstico base (precio actual)")
-        ax.plot(fc["fecha"], fc["escenario"], marker="s", ls="-", color=COLOR_ESC, label="Escenario (precio + elasticidad)")
+        ax.plot(fc["fecha"], fc["prediccion"], marker="o", ls="--", color="#F4A300", label="Pronóstico base")
+        ax.plot(fc["fecha"], fc["escenario"], marker="s", color=COLOR_ESC, label="Demanda escenario (precio)")
+        ax.plot(fc["fecha"], fc["vendidas"], ls=":", color="#6B8E23", label="Vendidas (tras faltantes)")
         ax.axvline(df_feat["fecha"].iloc[-1], color="#6B8E23", ls=":")
-        ax.set_ylabel("Unidades por semana"); ax.legend(fontsize=8); estilo(ax)
+        ax.set_ylabel("Pizzas por semana"); ax.legend(fontsize=8); estilo(ax)
         mostrar(fig)
     with cB:
         st.subheader("Sensibilidad al precio (todo el sistema)")
-        grilla = np.arange(-30, 31, 5)
-        filas = []
-        for d in grilla:
-            dd = {c: float(np.clip(d + extra[c], -90, 200)) for c in CATS}
-            mu = mult_demanda(pes_u, dd, eps, 0.0)
-            mi = mult_demanda(pes_r, dd, eps, 1.0)
-            mt = metricas_inventario(est, g_pron * mult_insumos(shares, dd, eps), Z, L, S_ped, H_men, dias_anio)
-            filas.append({"d": d, "ingreso": (mi - 1) * 100, "unidades": (mu - 1) * 100,
-                          "costo": (mt["Costo_EOQ"].sum() / cb - 1) * 100})
-        sens = pd.DataFrame(filas)
+        b = sens.loc[sens["d"] == 0].iloc[0]
         fig, ax = plt.subplots(figsize=(5.5, 3.8))
-        ax.plot(sens["d"], sens["ingreso"], marker="o", color=COLOR_ESC, label="Ingreso")
-        ax.plot(sens["d"], sens["unidades"], marker="o", color="#F4A300", label="Unidades")
-        ax.plot(sens["d"], sens["costo"], marker="o", color="#6B8E23", label="Costo inventario")
+        for col, color, lab in [("ingreso", COLOR_ESC, "Ingreso"), ("dem", "#F4A300", "Demanda"),
+                                ("c_inv", "#6B8E23", "Costo inventario"), ("margen", COLOR_BASE, "Margen")]:
+            ax.plot(sens["d"], (sens[col] / b[col] - 1) * 100, marker="o", color=color, label=lab,
+                    lw=2.5 if col == "margen" else 1.5)
         ax.axhline(0, color="gray", lw=0.8); ax.axvline(delta_global, color=COLOR_BASE, ls=":")
-        ax.set_xlabel("Δ precio global (%)"); ax.set_ylabel("Variación vs base (%)")
+        ax.axvline(opt["d"], color=COLOR_ESC, ls="--", lw=1)
+        ax.set_xlabel("Δ precio global (%)"); ax.set_ylabel("Variación vs Δ = 0 (%)")
         ax.legend(fontsize=8); estilo(ax)
         mostrar(fig)
 
-    st.subheader("Inventario: base vs escenario")
+    st.subheader("Inventario: histórico, base y escenario")
     comp = pd.DataFrame({
         "Demanda diaria histórica": met_hist["Demanda_diaria"],
         "Demanda diaria base": met_base["Demanda_diaria"], "Demanda diaria escenario": met_esc["Demanda_diaria"],
         "ROP base": met_base["ROP"], "ROP escenario": met_esc["ROP"],
         "EOQ base": met_base["EOQ"], "EOQ escenario": met_esc["EOQ"],
-        "Costo base (S/)": met_base["Costo_EOQ"], "Costo escenario (S/)": met_esc["Costo_EOQ"],
-        "Costo escenario (US$)": (met_esc["Costo_EOQ"] / tc).round(0),
+        "Fill rate escenario (%)": (R["fill_i"] * 100).round(2),
+        "Costo anual escenario (S/)": met_esc["Costo_con_SS"].round(0),
         "Factor total (g·m)": factor_esc.round(3)})
     st.dataframe(comp)
     st.download_button("⬇️ Descargar comparación (CSV)", csv_bytes(comp), "comparacion_inventario.csv", "text/csv")
-    if serie_sel == OPC_TOP5:
-        st.info("El pronóstico se calcula sobre el **Top 5 de productos** y su razón de crecimiento (g) se aplica "
-                "a todos los insumos. Para un producto individual, seleccione otra serie en el panel lateral.")
 
+    with st.expander("🔗 Mapa de dependencias: qué mueve cada parámetro"):
+        st.markdown(
+            """
+| Parámetro | Demanda | Inventario (SS/ROP/EOQ) | Servicio y ventas perdidas | Ingreso | Margen | Precio óptimo |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| Δ precio (global / categoría) | ✔ | ✔ | ✔ | ✔ | ✔ | — |
+| Elasticidad (modo / ε) | ✔ si Δ ≠ 0 | ✔ si Δ ≠ 0 | ✔ si Δ ≠ 0 | ✔ si Δ ≠ 0 | ✔ si Δ ≠ 0 | ✔ |
+| Alcance / serie, modelo, horizonte, árboles | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| N.º de insumos | — | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Lead time L, nivel de servicio | — | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Costos S y H | — | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Costo de insumos (%), tipo de cambio | — | — | — | — | ✔ | ✔ |
+"""
+        )
 # ============================== DEMANDA ======================================
 with tab_dem:
     st.header(f"Proyección de demanda con series de tiempo — {serie_sel}")
@@ -875,17 +943,20 @@ with tab_el:
 with tab_inv:
     st.header("Gestión de inventarios — revisión continua (s, Q)")
     st.write(f"Supuestos vigentes: L = **{L} días**, servicio **{nivel}** (Z = {Z}), S = **S/ {S_ped:,.2f}**, "
-             f"H = **S/ {H_men:,.2f}**, {dias_anio} días. Factor de escenario: g (pronóstico) × m (precio) por insumo.")
+             f"H = **S/ {H_men:,.2f}**, {dias_anio} días. Factor de escenario: g (pronóstico) × m (precio) por insumo. "
+             f"Alcance: **{serie_sel}** (los mismos productos del pronóstico).")
     st.subheader("Estadística diaria de consumo (porciones/día, histórico)")
     st.dataframe(est)
 
     st.subheader("Métricas de inventario — escenario actual")
     out = met_esc.copy()
     out.insert(0, "Factor", factor_esc.round(3))
+    out["Faltante_por_ciclo"] = (est["Desv_Std"] * factor_esc * np.sqrt(L) * G_Z).round(2)
+    out["Fill_rate_%"] = (R["fill_i"] * 100).round(3)
     st.dataframe(out)
     st.download_button("⬇️ Descargar métricas (CSV)", csv_bytes(out), "metricas_inventario.csv", "text/csv")
     st.caption("SS = Z·σ·√L · ROP = μ·L + SS · EOQ = √(2·D·S/H) · Costo_EOQ = √(2·D·S·H) · "
-               "Costo_con_SS = Costo_EOQ + H·SS. Unidades: μ y σ en porciones/día, L en días, "
+               "Costo_con_SS = Costo_EOQ + H·SS · Faltante por ciclo = σ·√L·G(z) · Fill rate = 1 − faltante ÷ EOQ. Unidades: μ y σ en porciones/día, L en días, "
                f"D = μ × {dias_anio} en porciones/año, S y H en S/. D anualiza el ritmo de demanda pronosticado para "
                f"las próximas {horizonte} semanas (supuesto: ese ritmo se mantiene); el plan semana a semana "
                "está en la tabla de requerimientos.")
@@ -947,6 +1018,15 @@ referencias simples (ingenuo y media móvil); en modo automático se usa el mode
 2. Pronóstico: g = pronóstico medio semanal ÷ media semanal histórica de la serie.
 3. Inventario: μ' = μ × g × m_insumo, con σ' = σ × g × m_insumo (coeficiente de variación constante).
 
+4. Inventario → ventas: con σ, L y Z se calcula el faltante esperado por ciclo (σ·√L·G(z)) y el *fill rate*
+   (1 − faltante ÷ EOQ). Las pizzas vendidas = demanda × fill rate: un menor nivel de servicio o un mayor lead time
+   reduce ventas e ingreso.
+5. Economía: margen = ingreso − costo de insumos (% del precio actual, fijo por pizza) − costo de inventario del
+   horizonte (costo anual × 7·h ÷ días del año, convertido a US$). El **precio óptimo** es el Δ que maximiza ese
+   margen, por lo que S, H, L, Z, el pronóstico y la elasticidad influyen en la recomendación de precio.
+6. Alcance común: la serie elegida (Top 5, todas las pizzas o un producto) define las pizzas del pronóstico, del
+   ingreso y de los insumos del inventario.
+
 **Escenarios y base.** Histórico = consumo 2015 · **Base** = pronóstico con el precio actual (factor g) ·
 Escenario = base × efecto del precio (factor m). Todas las variaciones «vs base» se miden contra la base.
 
@@ -959,7 +1039,8 @@ cambio del panel lateral (supuesto).
   (corte transversal), por lo que puede mezclarse con diferencias de popularidad entre productos.
 - ε global no es significativa; las elasticidades por categoría son inestables. Trate el simulador como escenario.
 - No hay datos de costos: el «óptimo de ingreso» no es un óptimo de utilidad.
-- El pronóstico cubre el Top 5; su factor g se extrapola a todos los insumos.
+- El fill rate por pizza se aproxima con el promedio ponderado del fill rate de sus insumos.
+- El costo de insumos por pizza es un supuesto (el dataset no trae costos).
 - Los costos S y H son supuestos del informe, no datos observados.
         """
     )
