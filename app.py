@@ -26,9 +26,11 @@ import streamlit as st
 from scipy import stats
 import warnings
 
+from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -458,10 +460,15 @@ def descriptivos(df, columnas, moda_en=None) -> pd.DataFrame:
                       "Desv. estándar": s.std(), "Mínimo": s.min(), "Máximo": s.max()})
     return pd.DataFrame(filas).set_index("Variable").round(3)
 # ----------------------------------------------------------------------------
-# 4. MODELO DE INVENTARIO (REVISIÓN CONTINUA, s-Q)
+# 4. MODELO DE INVENTARIO (REVISIÓN CONTINUA, s-Q) — EN LA MISMA BASE SEMANAL QUE LA DEMANDA
 # ----------------------------------------------------------------------------
 @st.cache_data(show_spinner="Procesando consumo de insumos…")
 def preparar_insumos(_df, clave: str, top_n: int):
+    """Consumo de insumos en PORCIONES POR SEMANA, con los mismos bloques de 7 días que la demanda.
+
+    Una porción = un ingrediente usado en una pizza vendida. Los días sin ninguna venta (local cerrado)
+    se interpolan igual que en la serie de demanda; los días con ventas pero sin ese insumo valen 0.
+    """
     d = _df[["order_date", "quantity", "pizza_category", "pizza_ingredients"]].copy()
     d["ingredient"] = d["pizza_ingredients"].str.split(",")
     d = d.explode("ingredient")
@@ -469,46 +476,68 @@ def preparar_insumos(_df, clave: str, top_n: int):
     d = d[d["ingredient"] != ""]
     top = d.groupby("ingredient")["quantity"].sum().sort_values(ascending=False).head(top_n).index.tolist()
     dt = d[d["ingredient"].isin(top)]
+    dias_venta = _df["order_date"].dt.normalize()
     consumo = dt.groupby([dt["order_date"].dt.normalize(), "ingredient"])["quantity"].sum().unstack(fill_value=0)
-    idx = pd.date_range(_df["order_date"].min().normalize(), _df["order_date"].max().normalize(), freq="D")
-    consumo = consumo.reindex(idx, fill_value=0)[top]
+    idx = pd.date_range(dias_venta.min(), dias_venta.max(), freq="D")
+    consumo = consumo.reindex(idx)[top]
+    abiertos = idx.isin(dias_venta.unique())
+    consumo.loc[abiertos] = consumo.loc[abiertos].fillna(0)
+    consumo = consumo.interpolate(limit_direction="both")
+    consumo = consumo.iloc[len(consumo) % 7:]                       # mismos bloques que la demanda
+    n_sem = len(consumo) // 7
+    semanal = consumo.groupby(np.repeat(np.arange(n_sem), 7)).sum()
+    semanal.index = consumo.index[6::7]
     shares = dt.groupby(["ingredient", "pizza_category"])["quantity"].sum().unstack(fill_value=0).reindex(top)
     shares = shares.div(shares.sum(axis=1), axis=0)
-    return consumo, shares
+    return semanal, shares
 
 
-def estadisticos_base(consumo: pd.DataFrame) -> pd.DataFrame:
-    return pd.DataFrame({"Media": consumo.mean().round(2), "Moda": consumo.mode().iloc[0].round(2),
-                         "Desv_Std": consumo.std().round(2), "Minimo": consumo.min().round(2),
-                         "Maximo": consumo.max().round(2)})
+def estadisticos_base(consumo_sem: pd.DataFrame, pizzas_sem: float) -> pd.DataFrame:
+    """Descriptivos del consumo semanal y conversión pizzas → porciones de cada insumo."""
+    return pd.DataFrame({"Porciones_por_pizza": (consumo_sem.mean() / pizzas_sem).round(3),
+                         "Media": consumo_sem.mean().round(2), "Moda": consumo_sem.round(0).mode().iloc[0],
+                         "Desv_Std": consumo_sem.std().round(2), "Minimo": consumo_sem.min().round(2),
+                         "Maximo": consumo_sem.max().round(2)})
 
 
-def metricas_inventario(est: pd.DataFrame, factor, Z, L, S, H, dias) -> pd.DataFrame:
-    """SS, ROP, EOQ y costos. 'factor' escala media y desviación (CV constante)."""
-    media = (est["Media"] * factor).round(2)
+def metricas_inventario(est: pd.DataFrame, factor, Z, L_dias, S, H_anual, sem_anio) -> pd.DataFrame:
+    """SS, ROP, EOQ y costos, TODO POR SEMANA.
+
+    μ y σ en porciones/semana · L en semanas (= días ÷ 7) · H semanal = H anual ÷ semanas del año.
+    'factor' escala media y desviación del consumo histórico (coeficiente de variación constante).
+    """
+    mu = (est["Media"] * factor).round(2)
     sd = (est["Desv_Std"] * factor).round(2)
-    D = (media * dias).round(0)
+    L = L_dias / 7.0
+    H = H_anual / sem_anio
     SS = np.ceil(Z * sd * np.sqrt(L)).astype(int)
-    ROP = np.ceil(media * L + SS).astype(int)
-    EOQ = np.round(np.sqrt(2 * D * S / H)).astype(int)
-    dias_ped = pd.Series(np.where(D > 0, dias * EOQ / D.replace(0, np.nan), np.nan), index=est.index).round(1)
-    costo = np.round(np.sqrt(2 * D * S * H)).astype(int)
-    return pd.DataFrame({"Demanda_diaria": media, "Demanda_anual": D, "SS": SS, "ROP": ROP, "EOQ": EOQ,
-                         "Dias_entre_pedidos": dias_ped, "Costo_EOQ": costo,
-                         "Costo_con_SS": costo + H * SS})
+    ROP = np.ceil(mu * L + SS).astype(int)
+    EOQ = np.round(np.sqrt(2 * mu * S / H)).astype(int)
+    sem_ped = pd.Series(np.where(mu > 0, EOQ / mu.replace(0, np.nan), np.nan), index=est.index).round(2)
+    costo = np.sqrt(2 * mu * S * H)                                   # pedir + mantener el lote, S/ por semana
+    return pd.DataFrame({"Demanda_semanal": mu, "Desv_semanal": sd, "SS": SS, "ROP": ROP, "EOQ": EOQ,
+                         "Semanas_entre_pedidos": sem_ped, "Costo_EOQ_sem": costo.round(2),
+                         "Costo_total_sem": (costo + H * SS).round(2)})
 
 
-def simular_ciclo(media, ROP, EOQ, SS, L, dias_sim=120):
+def pca_insumos(consumo_sem: pd.DataFrame):
+    """Reducción de dimensiones: PCA sobre el consumo semanal estandarizado de los insumos."""
+    p = PCA().fit(StandardScaler().fit_transform(consumo_sem.values))
+    cargas = pd.DataFrame(p.components_[:2].T, index=consumo_sem.columns, columns=["CP1", "CP2"]).round(3)
+    return p.explained_variance_ratio_, cargas
+
+
+def simular_ciclo(mu_sem, ROP, EOQ, SS, L_dias, semanas=16):
+    """Simulación día a día (consumo = μ/7), presentada en semanas."""
     stock, camino, serie = EOQ + SS, None, []
-    for t in range(dias_sim):
+    for t in range(semanas * 7):
         if camino and t == camino[0]:
             stock += camino[1]; camino = None
-        stock -= media
+        stock -= mu_sem / 7.0
         if stock <= ROP and camino is None:
-            camino = (t + int(L), EOQ)
+            camino = (t + int(L_dias), EOQ)
         serie.append(stock)
-    return np.array(serie)
-
+    return np.arange(1, semanas * 7 + 1) / 7.0, np.array(serie)
 
 # ----------------------------------------------------------------------------
 # 5. CARGA DE DATOS (la app NO trae datos: todo aparece al cargar el CSV)
@@ -573,7 +602,8 @@ nivel = st.sidebar.selectbox("Nivel de servicio (ciclo)", list(Z_TABLA.keys()), 
 Z = Z_TABLA[nivel]
 S_ped = st.sidebar.number_input("Costo por pedido S (S/)", 1.0, 1000.0, 45.0, 1.0)
 H_men = st.sidebar.number_input("Costo de mantener H (S/ por porción-año)", 0.1, 50.0, 1.0, 0.1)
-dias_anio = st.sidebar.number_input("Días del año comercial", 300, 366, 365)
+sem_anio = st.sidebar.number_input("Semanas operativas por año", 40, 53, 52,
+                                   help="Convierte H anual a H semanal (H ÷ semanas del año).")
 
 st.sidebar.subheader("💵 4 · Economía del escenario")
 cv = st.sidebar.slider("Costo de insumos por pizza (% del precio actual)", 0, 80, 30, 1,
@@ -609,11 +639,10 @@ pron_total = float(fc["prediccion"].sum())
 
 # --- Inventario (insumos del mismo alcance)
 consumo, shares = preparar_insumos(d_scope, clave_s, top_n)
-est = estadisticos_base(consumo)
-met_hist = metricas_inventario(est, 1.0, Z, L, S_ped, H_men, dias_anio)
+est = estadisticos_base(consumo, media_hist)        # porciones/semana y porciones por pizza
+met_hist = metricas_inventario(est, 1.0, Z, L, S_ped, H_men, sem_anio)
 
 G_Z = float(stats.norm.pdf(Z) - Z * stats.norm.sf(Z))  # función de pérdida normal estándar G(z)
-frac_h = 7 * horizonte / dias_anio                     # fracción del año que cubre el horizonte
 costo_pizza = cv / 100.0 * precio_unit                 # US$ por pizza (fijo)
 
 
@@ -626,17 +655,17 @@ def evaluar(dd: dict, Zv: float | None = None) -> dict:
     m_r = mult_demanda(pes_r, dd, eps, 1.0)            # precio → ingreso
     m_i = mult_insumos(shares, dd, eps)                # precio → consumo de cada insumo
     fac = g_pron * m_i                                 # pronóstico × precio → insumos
-    met = metricas_inventario(est, fac, Zv, L, S_ped, H_men, dias_anio)
+    met = metricas_inventario(est, fac, Zv, L, S_ped, H_men, sem_anio)
     # inventario → ventas: faltante esperado por ciclo = σ_L·G(z); fill rate = 1 − faltante / Q
-    faltante = est["Desv_Std"] * fac * np.sqrt(L) * Gv
+    faltante = met["Desv_semanal"] * np.sqrt(L / 7.0) * Gv
     fill_i = (1 - faltante / met["EOQ"].where(met["EOQ"] > 0)).clip(0, 1).fillna(1.0)
-    w = met["Demanda_diaria"] / met["Demanda_diaria"].sum()
+    w = met["Demanda_semanal"] / met["Demanda_semanal"].sum()
     fill = float((w * fill_i).sum())
     dem = pron_total * m_u
     vend = dem * fill
     ingreso = pron_total * precio_unit * m_r * fill
     c_ins = costo_pizza * vend
-    c_inv_s = float(met["Costo_con_SS"].sum()) * frac_h
+    c_inv_s = float(met["Costo_total_sem"].sum()) * horizonte          # S/ por semana × semanas
     c_inv = c_inv_s / tc
     return {"m_u": m_u, "m_r": m_r, "m_i": m_i, "fac": fac, "met": met, "fill_i": fill_i, "fill": fill,
             "dem": dem, "vend": vend, "perdidas": dem - vend, "ingreso": ingreso, "c_ins": c_ins,
@@ -744,12 +773,13 @@ with tab_panel:
 
     st.subheader("Inventario: histórico, base y escenario")
     comp = pd.DataFrame({
-        "Demanda diaria histórica": met_hist["Demanda_diaria"],
-        "Demanda diaria base": met_base["Demanda_diaria"], "Demanda diaria escenario": met_esc["Demanda_diaria"],
+        "Porciones por pizza": est["Porciones_por_pizza"],
+        "Consumo semanal histórico": met_hist["Demanda_semanal"],
+        "Consumo semanal base": met_base["Demanda_semanal"], "Consumo semanal escenario": met_esc["Demanda_semanal"],
         "ROP base": met_base["ROP"], "ROP escenario": met_esc["ROP"],
         "EOQ base": met_base["EOQ"], "EOQ escenario": met_esc["EOQ"],
         "Fill rate escenario (%)": (R["fill_i"] * 100).round(2),
-        "Costo anual escenario (S/)": met_esc["Costo_con_SS"].round(0),
+        f"Costo escenario {horizonte} sem. (S/)": (met_esc["Costo_total_sem"] * horizonte).round(0),
         "Factor total (g·m)": factor_esc.round(3)})
     st.dataframe(comp)
     st.download_button("⬇️ Descargar comparación (CSV)", csv_bytes(comp), "comparacion_inventario.csv", "text/csv")
@@ -793,7 +823,7 @@ with tab_ind:
          "Lectura": f"Incluye {R['met']['SS'].sum():,.0f} porciones de stock de seguridad"},
         {"Indicador": "Lote económico total (Σ EOQ)", "Valor": f"{R['met']['EOQ'].sum():,.0f} porciones",
          "Técnica analítica": "EOQ = √(2DS/H)",
-         "Lectura": f"Pedido cada {R['met']['Dias_entre_pedidos'].mean():.1f} días en promedio"},
+         "Lectura": f"Pedido cada {R['met']['Semanas_entre_pedidos'].mean():.1f} semanas en promedio"},
         {"Indicador": "Fill rate (demanda atendida)", "Valor": f"{R['fill'] * 100:.2f} %",
          "Técnica analítica": "Función de pérdida normal G(z) sobre el inventario",
          "Lectura": f"{R['perdidas']:,.1f} pizzas perdidas por faltantes en el horizonte"},
@@ -1209,18 +1239,18 @@ with tab_el:
         st.warning("El segmento seleccionado no tiene ventas.")
     else:
         sim = simular_precio(df_seg, eps, list(range(-30, 31, 5)))
-        opt = sim.loc[sim["Ingreso ($)"].idxmax()]
+        opt_sim = sim.loc[sim["Ingreso ($)"].idxmax()]
         k1, k2, k3 = st.columns(3)
         k1.metric("Ingreso base", f"${df_seg['total_price'].sum():,.0f}")
-        k2.metric("Δ precio que maximiza el ingreso", f"{opt['Δ precio (%)']:+.0f} %")
-        k3.metric("Ingreso en el óptimo", f"${opt['Ingreso ($)']:,.0f}", f"{opt['Δ ingreso (%)']:+.1f} %")
+        k2.metric("Δ precio que maximiza el ingreso", f"{opt_sim['Δ precio (%)']:+.0f} %")
+        k3.metric("Ingreso en el óptimo", f"${opt_sim['Ingreso ($)']:,.0f}", f"{opt_sim['Δ ingreso (%)']:+.1f} %")
         fig, ax = plt.subplots(figsize=(9, 3.6))
         ax.plot(sim["Δ precio (%)"], sim["Ingreso ($)"], marker="o", color=COLOR_ESC, label="Ingreso")
         ax.axvline(delta_global, color=COLOR_BASE, ls=":", label="Escenario del panel")
         ax.set_xlabel("Δ precio (%)"); ax.set_ylabel("Ingreso ($)"); ax.legend(); estilo(ax)
         mostrar(fig)
         st.dataframe(sim.round(2).set_index("Δ precio (%)"))
-        if opt["Δ precio (%)"] in (sim["Δ precio (%)"].min(), sim["Δ precio (%)"].max()):
+        if opt_sim["Δ precio (%)"] in (sim["Δ precio (%)"].min(), sim["Δ precio (%)"].max()):
             st.warning("El óptimo cae en el **borde** del rango simulado: con |ε| < 1 el ingreso crece con el precio. "
                        "El modelo no incluye costos, competencia ni caídas no lineales de la demanda; no lo extrapole.")
 
@@ -1235,28 +1265,63 @@ with tab_el:
 # ============================== INVENTARIO ===================================
 with tab_inv:
     st.header("Gestión de inventarios — revisión continua (s, Q)")
-    st.write(f"Supuestos vigentes: L = **{L} días**, servicio **{nivel}** (Z = {Z}), S = **S/ {S_ped:,.2f}**, "
-             f"H = **S/ {H_men:,.2f}**, {dias_anio} días. Factor de escenario: g (pronóstico) × m (precio) por insumo. "
-             f"Alcance: **{serie_sel}** (los mismos productos del pronóstico).")
-    st.subheader("Estadística diaria de consumo (porciones/día, histórico)")
-    st.dataframe(est)
+    st.write(f"Alcance: **{serie_sel}** (los mismos productos del pronóstico). Todo el inventario se expresa en la "
+             "**misma base que la demanda: semanas**. El consumo de insumos sale de la demanda en pizzas mediante "
+             "las porciones que cada pizza usa de cada insumo.")
 
-    st.subheader("Métricas de inventario — escenario actual")
+    st.subheader("Conversión de unidades: demanda → inventario")
+    st.dataframe(pd.DataFrame([
+        {"Magnitud": "Demanda", "Unidad": "pizzas / semana", "Valor": f"{fc['prediccion'].mean():,.1f}",
+         "Origen": f"Pronóstico de series de tiempo ({modelo_usado})"},
+        {"Magnitud": "Consumo del insumo i", "Unidad": "porciones / semana",
+         "Valor": "pizzas/semana × porciones por pizza × m_i", "Origen": "Receta histórica (pizza_ingredients) y elasticidad"},
+        {"Magnitud": "Lead time L", "Unidad": "semanas", "Valor": f"{L} días ÷ 7 = {L / 7:.3f}", "Origen": "Panel lateral"},
+        {"Magnitud": "Costo de mantener H", "Unidad": "S/ por porción·semana",
+         "Valor": f"{H_men:,.2f} ÷ {sem_anio} = {H_men / sem_anio:.4f}", "Origen": "Panel lateral (H anual)"},
+        {"Magnitud": "Costo por pedido S", "Unidad": "S/ por pedido", "Valor": f"{S_ped:,.2f}", "Origen": "Panel lateral"},
+        {"Magnitud": "Costo de inventario", "Unidad": f"S/ por semana × {horizonte} semanas → US$",
+         "Valor": f"S/ {R['c_inv_s']:,.0f} ÷ {tc:.2f} = US$ {R['c_inv']:,.0f}", "Origen": "Tipo de cambio del panel"},
+    ]).set_index("Magnitud"), use_container_width=True)
+
+    st.subheader("Consumo histórico de insumos (porciones por semana)")
+    st.dataframe(est, use_container_width=True)
+    st.caption("Porciones_por_pizza = consumo semanal medio del insumo ÷ pizzas semanales medias del alcance.")
+
+    st.subheader("Reducción de dimensiones: PCA del consumo de insumos")
+    evr, cargas = pca_insumos(consumo)
+    n95 = int(np.searchsorted(evr.cumsum(), 0.95) + 1)
+    q1, q2 = st.columns([3, 2])
+    with q1:
+        fig, ax = plt.subplots(figsize=(7, 3.2))
+        ax.bar(range(1, len(evr) + 1), evr * 100, color="#6B8E23", label="Varianza por componente")
+        ax.plot(range(1, len(evr) + 1), evr.cumsum() * 100, marker="o", color=COLOR_ESC, label="Acumulada")
+        ax.axhline(95, color="gray", ls="--", lw=1)
+        ax.set_xlabel("Componente principal"); ax.set_ylabel("% de varianza"); ax.legend(fontsize=8); estilo(ax)
+        mostrar(fig)
+    with q2:
+        st.metric("Componentes para ≥ 95 % de la varianza", f"{n95} de {len(evr)}")
+        st.metric("Varianza explicada por CP1", f"{evr[0] * 100:.1f} %")
+        st.dataframe(cargas, use_container_width=True)
+    st.caption(f"Los {len(evr)} insumos se resumen en {n95} componentes: su consumo no es independiente, lo determinan "
+               f"las pizzas vendidas ({d_scope['pizza_name'].nunique()} productos en el alcance). Esto respalda calcular "
+               "el consumo de insumos a partir de la demanda de pizzas (porciones por pizza).")
+
+    st.subheader("Métricas de inventario — escenario actual (por semana)")
     out = met_esc.copy()
-    out.insert(0, "Factor", factor_esc.round(3))
-    out["Faltante_por_ciclo"] = (est["Desv_Std"] * factor_esc * np.sqrt(L) * G_Z).round(2)
+    out.insert(0, "Factor (g·m)", factor_esc.round(3))
+    out["Faltante_por_ciclo"] = (met_esc["Desv_semanal"] * np.sqrt(L / 7.0) * G_Z).round(2)
     out["Fill_rate_%"] = (R["fill_i"] * 100).round(3)
-    st.dataframe(out)
+    out[f"Costo_{horizonte}_sem"] = (met_esc["Costo_total_sem"] * horizonte).round(0)
+    st.dataframe(out, use_container_width=True)
     st.download_button("⬇️ Descargar métricas (CSV)", csv_bytes(out), "metricas_inventario.csv", "text/csv")
-    st.caption("SS = Z·σ·√L · ROP = μ·L + SS · EOQ = √(2·D·S/H) · Costo_EOQ = √(2·D·S·H) · "
-               "Costo_con_SS = Costo_EOQ + H·SS · Faltante por ciclo = σ·√L·G(z) · Fill rate = 1 − faltante ÷ EOQ. Unidades: μ y σ en porciones/día, L en días, "
-               f"D = μ × {dias_anio} en porciones/año, S y H en S/. D anualiza el ritmo de demanda pronosticado para "
-               f"las próximas {horizonte} semanas (supuesto: ese ritmo se mantiene); el plan semana a semana "
-               "está en la tabla de requerimientos.")
+    st.caption("μ, σ en porciones/semana · L en semanas · H en S/ por porción·semana · "
+               "SS = Z·σ·√L · ROP = μ·L + SS · EOQ = √(2·μ·S/H) · Costo_EOQ_sem = √(2·μ·S·H) · "
+               "Costo_total_sem = Costo_EOQ_sem + H·SS · Faltante por ciclo = σ·√L·G(z) · Fill rate = 1 − faltante ÷ EOQ. "
+               "El EOQ no cambia si se calcula con datos anuales o semanales, siempre que D y H usen el mismo periodo.")
 
     g1, g2 = st.columns(2)
-    for ax_col, campo, color, titulo in [(g1, "ROP", "#e66101", "Punto de reorden (ROP)"),
-                                         (g2, "EOQ", "#2b83ba", "Lote económico (EOQ)")]:
+    for ax_col, campo, color, titulo in [(g1, "ROP", "#e66101", "Punto de reorden (ROP, porciones)"),
+                                         (g2, "EOQ", "#2b83ba", "Lote económico (EOQ, porciones)")]:
         with ax_col:
             idx = np.arange(len(met_esc))
             fig, ax = plt.subplots(figsize=(7, 4))
@@ -1269,24 +1334,25 @@ with tab_inv:
     st.subheader("Ciclo de inventario simulado")
     ins = st.selectbox("Insumo", met_esc.index.tolist())
     r = met_esc.loc[ins]
-    ciclo = simular_ciclo(r["Demanda_diaria"], r["ROP"], r["EOQ"], r["SS"], L)
+    x_sem, ciclo = simular_ciclo(r["Demanda_semanal"], r["ROP"], r["EOQ"], r["SS"], L, semanas=horizonte)
     fig, ax = plt.subplots(figsize=(10, 3.6))
-    ax.plot(ciclo, color=COLOR_ESC, label="Stock")
+    ax.plot(x_sem, ciclo, color=COLOR_ESC, label="Stock")
     ax.axhline(r["ROP"], color="#F4A300", ls="--", label=f"ROP = {r['ROP']:.0f}")
     ax.axhline(r["SS"], color="#6B8E23", ls=":", label=f"SS = {r['SS']:.0f}")
-    ax.set_xlabel("Días"); ax.set_ylabel("Porciones"); ax.legend(fontsize=8); estilo(ax)
+    ax.set_xlabel(f"Semanas del horizonte (1–{horizonte})"); ax.set_ylabel("Porciones")
+    ax.legend(fontsize=8); estilo(ax)
     mostrar(fig)
+    st.caption(f"Consumo de {r['Demanda_semanal']:,.1f} porciones/semana; se pide un lote de {r['EOQ']:,.0f} "
+               f"porciones cada {r['Semanas_entre_pedidos']:.1f} semanas.")
 
     st.subheader(f"Requerimiento semanal proyectado por insumo ({horizonte} semanas)")
-    if aplicar_pron:
-        f_t = (fc["prediccion"] / media_hist).values
-    else:
-        f_t = np.ones(horizonte)
-    plan = pd.DataFrame(np.ceil(np.outer(est["Media"].values * 7 * m_insumo.values, f_t)),
+    pizzas_t = fc["prediccion"].values if aplicar_pron else np.full(horizonte, media_hist)
+    plan = pd.DataFrame(np.ceil(np.outer(est["Porciones_por_pizza"].values * m_insumo.values, pizzas_t)),
                         index=est.index, columns=fc["fecha"].dt.strftime("%d/%m/%Y")).astype(int)
-    st.dataframe(plan)
+    st.dataframe(plan, use_container_width=True)
     st.download_button("⬇️ Descargar plan (CSV)", csv_bytes(plan), "plan_requerimiento.csv", "text/csv")
-    st.caption("Requerimiento = consumo diario histórico × 7 × (pronóstico semanal ÷ media histórica) × multiplicador de precio.")
+    st.caption("Requerimiento (porciones/semana) = pizzas pronosticadas en la semana × porciones por pizza × "
+               "multiplicador de precio del insumo.")
 
 # ============================== METODOLOGÍA ==================================
 with tab_met:
@@ -1305,7 +1371,11 @@ semanal (bloques de 7 días). Se analiza con **descomposición aditiva**, prueba
 Se validan con backtesting de origen móvil (4 semanas por corte) contra dos referencias simples (ingenuo y media
 móvil) usando MAE, RMSE y MAPE; en modo automático se usa el de menor MAPE.
 
-**Inventario.** Revisión continua: SS = Z·σ·√L, ROP = μ·L + SS, EOQ = √(2DS/H).
+**Reducción de dimensiones.** PCA sobre el consumo semanal estandarizado de los insumos: pocas componentes
+explican casi toda la varianza porque el consumo lo determinan las pizzas vendidas.
+
+**Inventario.** Revisión continua en base **semanal** (la misma de la demanda): μ y σ en porciones/semana,
+L en semanas (días ÷ 7), H semanal (H anual ÷ semanas del año). SS = Z·σ·√L, ROP = μ·L + SS, EOQ = √(2μS/H).
 
 **Conexión entre modelos.**
 1. Precio: cada categoría recibe Δ_c; la demanda se multiplica por (1+Δ_c)^ε_c y el ingreso por (1+Δ_c)^(1+ε_c).
@@ -1316,7 +1386,7 @@ móvil) usando MAE, RMSE y MAPE; en modo automático se usa el de menor MAPE.
    (1 − faltante ÷ EOQ). Las pizzas vendidas = demanda × fill rate: un menor nivel de servicio o un mayor lead time
    reduce ventas e ingreso.
 5. Economía: margen = ingreso − costo de insumos (% del precio actual, fijo por pizza) − costo de inventario del
-   horizonte (costo anual × 7·h ÷ días del año, convertido a US$). El **precio óptimo** es el Δ que maximiza ese
+   horizonte (costo semanal × h semanas, convertido a US$). El **precio óptimo** es el Δ que maximiza ese
    margen, por lo que S, H, L, Z, el pronóstico y la elasticidad influyen en la recomendación de precio.
 6. Alcance común: la serie elegida (Top 5, todas las pizzas o un producto) define las pizzas del pronóstico, del
    ingreso y de los insumos del inventario.
@@ -1324,9 +1394,9 @@ móvil) usando MAE, RMSE y MAPE; en modo automático se usa el de menor MAPE.
 **Escenarios y base.** Histórico = consumo 2015 · **Base** = pronóstico con el precio actual (factor g) ·
 Escenario = base × efecto del precio (factor m). Todas las variaciones «vs base» se miden contra la base.
 
-**Unidades y monedas.** Demanda en pizzas/semana; insumos en porciones/día (una porción = un ingrediente en
-una pizza vendida). Ventas e ingresos en US$ (moneda del dataset); S y H en S/; se convierten con el tipo de
-cambio del panel lateral (supuesto).
+**Unidades y monedas.** Tiempo: semanas en todo el sistema (horizonte, pronóstico, consumo, lead time, costos).
+Cantidades: la demanda en pizzas se convierte a porciones de cada insumo con la receta histórica (porciones por
+pizza). Dinero: ventas e ingresos en US$ (moneda del dataset); S y H en S/, convertidos con el tipo de cambio.
 
 **Limitaciones.**
 - Los precios no cambian en el tiempo dentro de 2015: la elasticidad se identifica con variación *entre* variantes
