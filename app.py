@@ -602,15 +602,18 @@ frac_h = 7 * horizonte / dias_anio                     # fracción del año que 
 costo_pizza = cv / 100.0 * precio_unit                 # US$ por pizza (fijo)
 
 
-def evaluar(dd: dict) -> dict:
-    """Un escenario completo, con todas las unidades llevadas al MISMO horizonte y a US$."""
+def evaluar(dd: dict, Zv: float | None = None) -> dict:
+    """Un escenario completo, con todas las unidades llevadas al MISMO horizonte y a US$.
+    Zv permite evaluar otro nivel de servicio (escenarios prescriptivos)."""
+    Zv = Z if Zv is None else Zv
+    Gv = float(stats.norm.pdf(Zv) - Zv * stats.norm.sf(Zv))
     m_u = mult_demanda(pes_u, dd, eps, 0.0)            # precio → unidades
     m_r = mult_demanda(pes_r, dd, eps, 1.0)            # precio → ingreso
     m_i = mult_insumos(shares, dd, eps)                # precio → consumo de cada insumo
     fac = g_pron * m_i                                 # pronóstico × precio → insumos
-    met = metricas_inventario(est, fac, Z, L, S_ped, H_men, dias_anio)
+    met = metricas_inventario(est, fac, Zv, L, S_ped, H_men, dias_anio)
     # inventario → ventas: faltante esperado por ciclo = σ_L·G(z); fill rate = 1 − faltante / Q
-    faltante = est["Desv_Std"] * fac * np.sqrt(L) * G_Z
+    faltante = est["Desv_Std"] * fac * np.sqrt(L) * Gv
     fill_i = (1 - faltante / met["EOQ"].where(met["EOQ"] > 0)).clip(0, 1).fillna(1.0)
     w = met["Demanda_diaria"] / met["Demanda_diaria"].sum()
     fill = float((w * fill_i).sum())
@@ -649,9 +652,9 @@ def pct(a, b):
 # ----------------------------------------------------------------------------
 # 8. INTERFAZ
 # ----------------------------------------------------------------------------
-tab_panel, tab_dem, tab_el, tab_inv, tab_met = st.tabs(
-    ["🧭 Panel integrado", "📈 Demanda (series de tiempo)", "💲 Elasticidad de precios",
-     "📦 Inventario", "📚 Metodología y supuestos"])
+tab_panel, tab_ind, tab_esc, tab_dem, tab_el, tab_inv, tab_met = st.tabs(
+    ["🧭 Panel integrado", "📊 Indicadores clave", "🎯 Escenarios prescriptivos",
+     "📈 Demanda (series de tiempo)", "💲 Elasticidad de precios", "📦 Inventario", "📚 Metodología y supuestos"])
 
 # ============================ PANEL INTEGRADO ================================
 with tab_panel:
@@ -750,6 +753,249 @@ with tab_panel:
 | Costo de insumos (%), tipo de cambio | — | — | — | — | ✔ | ✔ |
 """
         )
+# ============================ INDICADORES CLAVE ==============================
+with tab_ind:
+    st.header("Indicadores clave del problema")
+    st.write("Cada indicador es el resultado de una técnica analítica distinta y responde a una parte del problema: "
+             "¿cuánto reacciona la demanda al precio?, ¿cuánto se venderá?, ¿cuánto y cuándo comprar?, "
+             "¿qué servicio y qué margen se obtienen? Los valores corresponden al escenario actual del panel lateral.")
+
+    ic = ols_g["tabla"].loc["ln_precio"]
+    mape_u = bt_res[modelo_usado][2]
+    resumen_ind = pd.DataFrame([
+        {"Indicador": "Elasticidad precio-demanda (ε)", "Valor": f"{ols_g['eps']:.3f}",
+         "Técnica analítica": "Regresión OLS log-log con controles de tamaño y categoría",
+         "Lectura": "Inelástica (|ε| < 1): un alza de precio reduce poco las unidades" if abs(ols_g["eps"]) < 1
+         else "Elástica (|ε| ≥ 1): un alza de precio reduce el ingreso"},
+        {"Indicador": f"Demanda proyectada ({horizonte} sem.)", "Valor": f"{R['dem']:,.0f} pizzas",
+         "Técnica analítica": f"Series de tiempo · {modelo_usado} (pronóstico recursivo)",
+         "Lectura": f"Promedio de {R['dem'] / horizonte:,.0f} pizzas por semana"},
+        {"Indicador": "Error del pronóstico (MAPE)", "Valor": f"{mape_u:.2f} %",
+         "Técnica analítica": "Backtesting con ventana expansiva",
+         "Lectura": "Margen de error esperado al planificar compras"},
+        {"Indicador": "Punto de reorden total (Σ ROP)", "Valor": f"{R['met']['ROP'].sum():,.0f} porciones",
+         "Técnica analítica": "Modelo de inventario de revisión continua (s, Q)",
+         "Lectura": f"Incluye {R['met']['SS'].sum():,.0f} porciones de stock de seguridad"},
+        {"Indicador": "Lote económico total (Σ EOQ)", "Valor": f"{R['met']['EOQ'].sum():,.0f} porciones",
+         "Técnica analítica": "EOQ = √(2DS/H)",
+         "Lectura": f"Pedido cada {R['met']['Dias_entre_pedidos'].mean():.1f} días en promedio"},
+        {"Indicador": "Fill rate (demanda atendida)", "Valor": f"{R['fill'] * 100:.2f} %",
+         "Técnica analítica": "Función de pérdida normal G(z) sobre el inventario",
+         "Lectura": f"{R['perdidas']:,.1f} pizzas perdidas por faltantes en el horizonte"},
+        {"Indicador": f"Margen del escenario ({horizonte} sem.)", "Valor": f"US$ {R['margen']:,.0f}",
+         "Técnica analítica": "Integración de los tres modelos (ingreso − insumos − inventario)",
+         "Lectura": f"{(R['margen'] / B['margen'] - 1) * 100:+.1f} % frente a la base"},
+    ]).set_index("Indicador")
+    st.dataframe(resumen_ind, use_container_width=True)
+    st.download_button("⬇️ Descargar indicadores (CSV)", csv_bytes(resumen_ind), "indicadores.csv", "text/csv")
+
+    # --- Indicador 1: elasticidad
+    st.subheader("1 · Elasticidad precio-demanda")
+    i1, i2, i3 = st.columns(3)
+    i1.metric("ε (OLS log-log)", f"{ols_g['eps']:.3f}")
+    i2.metric("IC 95 %", f"[{ic['IC95_inf']:.2f} ; {ic['IC95_sup']:.2f}]")
+    i3.metric("p-valor / R²", f"{ols_g['p']:.3f} / {ols_g['r2']:.3f}")
+    fig, ax = plt.subplots(figsize=(9, 3.4))
+    for c, col in zip(CATS, PALETA):
+        sub = agg[agg["pizza_category"] == c]
+        ax.scatter(sub["ln_precio"], sub["ln_cantidad"], color=col, label=c, alpha=0.8)
+    xs = np.linspace(agg["ln_precio"].min(), agg["ln_precio"].max(), 20)
+    ax.plot(xs, agg["ln_cantidad"].mean() + ols_g["eps"] * (xs - agg["ln_precio"].mean()),
+            color=COLOR_BASE, lw=2, label=f"Pendiente ε = {ols_g['eps']:.2f}")
+    ax.set_xlabel("ln(precio)"); ax.set_ylabel("ln(cantidad)"); ax.legend(fontsize=8); estilo(ax)
+    mostrar(fig)
+    st.caption("La pendiente es la elasticidad estimada con controles de tamaño y categoría. "
+               + ("No es significativa al 5 %: se usa como escenario referencial." if ols_g["p"] > 0.05 else ""))
+
+    # --- Indicador 2: demanda y error
+    st.subheader("2 · Demanda proyectada y error del pronóstico")
+    j1, j2 = st.columns([3, 2])
+    with j1:
+        fig, ax = plt.subplots(figsize=(7.5, 3.4))
+        h16 = df_feat[["fecha", "unidades"]].tail(16)
+        ax.plot(h16["fecha"], h16["unidades"], marker="o", color=COLOR_BASE, label="Histórico")
+        ax.plot(fc["fecha"], fc["prediccion"], marker="o", ls="--", color="#F4A300", label="Pronóstico")
+        ax.fill_between(fc["fecha"], fc["prediccion"] * (1 - mape_u / 100), fc["prediccion"] * (1 + mape_u / 100),
+                        color="#F4A300", alpha=0.2, label=f"± MAPE ({mape_u:.1f} %)")
+        ax.set_ylabel("Pizzas por semana"); ax.legend(fontsize=8); estilo(ax)
+        mostrar(fig)
+    with j2:
+        mapes = pd.Series({n: r[2] for n, r in bt_res.items()}).sort_values()
+        fig, ax = plt.subplots(figsize=(5, 3.4))
+        ax.barh(mapes.index[::-1], mapes.values[::-1],
+                color=[COLOR_ESC if n == modelo_usado else "#BBBBBB" for n in mapes.index[::-1]])
+        for k, v in enumerate(mapes.values[::-1]):
+            ax.text(v, k, f" {v:.2f} %", va="center", fontsize=8)
+        ax.set_xlabel("MAPE (%)"); ax.set_title("Error por modelo (backtesting)", fontsize=10); estilo(ax)
+        mostrar(fig)
+
+    # --- Indicador 3: inventario
+    st.subheader("3 · Política de inventario por insumo (ROP, SS y EOQ)")
+    k1, k2 = st.columns(2)
+    with k1:
+        mi = R["met"].sort_values("ROP")
+        fig, ax = plt.subplots(figsize=(6.5, 3.8))
+        ax.barh(mi.index, mi["ROP"] - mi["SS"], color="#F4A300", label="Demanda en el lead time (μ·L)")
+        ax.barh(mi.index, mi["SS"], left=mi["ROP"] - mi["SS"], color=COLOR_ESC, label="Stock de seguridad")
+        ax.set_xlabel("Porciones"); ax.set_title("Punto de reorden = μ·L + SS", fontsize=10)
+        ax.legend(fontsize=8); estilo(ax)
+        mostrar(fig)
+    with k2:
+        me = R["met"].sort_values("EOQ")
+        fig, ax = plt.subplots(figsize=(6.5, 3.8))
+        ax.barh(me.index, me["EOQ"], color="#2b83ba")
+        ax.set_xlabel("Porciones por pedido"); ax.set_title("Lote económico (EOQ)", fontsize=10); estilo(ax)
+        mostrar(fig)
+
+    # --- Indicador 4: servicio vs costo
+    st.subheader("4 · Nivel de servicio: fill rate vs costo de inventario")
+    curva = pd.DataFrame([{"Servicio": n, "Z": z, **{k: v for k, v in evaluar(d_efectivos, z).items()
+                                                      if k in ("fill", "c_inv", "margen", "perdidas")}}
+                          for n, z in Z_TABLA.items()])
+    fig, ax = plt.subplots(figsize=(9, 3.4))
+    ax.bar(curva["Servicio"], curva["c_inv"], color="#6B8E23", alpha=0.7, label="Costo de inventario (US$)")
+    ax.set_ylabel(f"Costo inventario {horizonte} sem. (US$)")
+    ax2 = ax.twinx()
+    ax2.plot(curva["Servicio"], curva["fill"] * 100, marker="o", color=COLOR_ESC, label="Fill rate (%)")
+    ax2.set_ylabel("Fill rate (%)")
+    ax.set_title("Más servicio = más stock de seguridad (costo) y menos ventas perdidas", fontsize=10)
+    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left"); estilo(ax)
+    mostrar(fig)
+
+    # --- Indicador 5: margen
+    st.subheader(f"5 · Composición del margen ({horizonte} semanas, US$)")
+    partes = pd.Series({"Ingreso": R["ingreso"], "Costo de insumos": -R["c_ins"],
+                        "Costo de inventario": -R["c_inv"], "Margen": R["margen"]})
+    fig, ax = plt.subplots(figsize=(9, 3.4))
+    acum, x = 0.0, 0
+    for nombre, v in partes.items():
+        if nombre == "Margen":
+            ax.bar(x, v, color=COLOR_BASE); ax.text(x, v, f"{v:,.0f}", ha="center", va="bottom", fontsize=8)
+        else:
+            ax.bar(x, v, bottom=acum if v < 0 else 0, color=COLOR_ESC if v < 0 else "#F4A300")
+            ax.text(x, acum if v < 0 else v, f"{v:,.0f}", ha="center", va="bottom", fontsize=8)
+            acum += v
+        x += 1
+    ax.set_xticks(range(len(partes))); ax.set_xticklabels(partes.index); ax.set_ylabel("US$"); estilo(ax)
+    mostrar(fig)
+
+# ========================= ESCENARIOS PRESCRIPTIVOS ==========================
+with tab_esc:
+    st.header("Escenarios prescriptivos: ¿qué decisión conviene tomar?")
+    st.write("Se evalúan varias decisiones de precio y de nivel de servicio con el **mismo sistema integrado** "
+             "(elasticidad → demanda → inventario → margen). Se recomienda el escenario de **mayor margen** que "
+             "cumpla las restricciones operativas. Puede editar, agregar o quitar escenarios en la tabla.")
+
+    cat_principal = pes_u.idxmax()
+    nivel_actual = nivel
+    esc_default = pd.DataFrame([
+        {"Escenario": "E0 · Base (situación actual)", "Δ precio global (%)": 0, "Categoría con ajuste": "—",
+         "Ajuste categoría (pp)": 0, "Nivel de servicio": nivel_actual},
+        {"Escenario": "E1 · Alza de precio 10 %", "Δ precio global (%)": 10, "Categoría con ajuste": "—",
+         "Ajuste categoría (pp)": 0, "Nivel de servicio": nivel_actual},
+        {"Escenario": "E2 · Promoción −10 %", "Δ precio global (%)": -10, "Categoría con ajuste": "—",
+         "Ajuste categoría (pp)": 0, "Nivel de servicio": nivel_actual},
+        {"Escenario": "E3 · Alza 10 % + servicio 99 %", "Δ precio global (%)": 10, "Categoría con ajuste": "—",
+         "Ajuste categoría (pp)": 0, "Nivel de servicio": "99 %"},
+        {"Escenario": f"E4 · Alza 10 % solo en {cat_principal}", "Δ precio global (%)": 0,
+         "Categoría con ajuste": cat_principal, "Ajuste categoría (pp)": 10, "Nivel de servicio": nivel_actual},
+        {"Escenario": "E5 · Ahorro: servicio 90 %", "Δ precio global (%)": 0, "Categoría con ajuste": "—",
+         "Ajuste categoría (pp)": 0, "Nivel de servicio": "90 %"},
+    ])
+    esc_in = st.data_editor(
+        esc_default, num_rows="dynamic", use_container_width=True, hide_index=True, key="editor_escenarios",
+        column_config={
+            "Δ precio global (%)": st.column_config.NumberColumn(min_value=-30, max_value=30, step=1),
+            "Categoría con ajuste": st.column_config.SelectboxColumn(options=["—"] + CATS),
+            "Ajuste categoría (pp)": st.column_config.NumberColumn(min_value=-30, max_value=30, step=1),
+            "Nivel de servicio": st.column_config.SelectboxColumn(options=list(Z_TABLA.keys())),
+        })
+
+    r1, r2 = st.columns(2)
+    fill_min = r1.slider("Restricción: fill rate mínimo (%)", 95.0, 100.0, 99.90, 0.01)
+    caida_max = r2.slider("Restricción: caída máxima de demanda vs E0 (%)", 0, 30, 10, 1)
+
+    filas = []
+    for _, e in esc_in.dropna(subset=["Escenario"]).iterrows():
+        dg = float(e.get("Δ precio global (%)") or 0)
+        cat_e, aj = e.get("Categoría con ajuste") or "—", float(e.get("Ajuste categoría (pp)") or 0)
+        dd = {c: float(np.clip(dg + (aj if c == cat_e else 0), -90, 200)) for c in CATS}
+        zz = Z_TABLA.get(e.get("Nivel de servicio"), Z)
+        r = evaluar(dd, zz)
+        filas.append({"Escenario": e["Escenario"], "Demanda (pizzas)": r["dem"], "Fill rate (%)": r["fill"] * 100,
+                      "Pizzas perdidas": r["perdidas"], "Ingreso (US$)": r["ingreso"],
+                      "Costo insumos (US$)": r["c_ins"], "Costo inventario (US$)": r["c_inv"],
+                      "Margen (US$)": r["margen"], "Σ ROP (porc.)": r["met"]["ROP"].sum(),
+                      "Σ SS (porc.)": r["met"]["SS"].sum(), "Σ EOQ (porc.)": r["met"]["EOQ"].sum()})
+    tabla_esc = pd.DataFrame(filas).set_index("Escenario")
+
+    if tabla_esc.empty:
+        st.warning("Agregue al menos un escenario en la tabla.")
+    else:
+        dem_ref = tabla_esc["Demanda (pizzas)"].iloc[0]
+        tabla_esc["Δ demanda vs E0 (%)"] = (tabla_esc["Demanda (pizzas)"] / dem_ref - 1) * 100
+        tabla_esc["Δ margen vs E0 (%)"] = (tabla_esc["Margen (US$)"] / tabla_esc["Margen (US$)"].iloc[0] - 1) * 100
+        tabla_esc["Cumple restricciones"] = ((tabla_esc["Fill rate (%)"] >= fill_min)
+                                             & (tabla_esc["Δ demanda vs E0 (%)"] >= -caida_max))
+        factibles = tabla_esc[tabla_esc["Cumple restricciones"]]
+        reco = factibles["Margen (US$)"].idxmax() if not factibles.empty else None
+
+        st.subheader("Comparación de escenarios")
+        st.dataframe(tabla_esc.style.format({
+            "Demanda (pizzas)": "{:,.0f}", "Fill rate (%)": "{:.3f}", "Pizzas perdidas": "{:,.1f}",
+            "Ingreso (US$)": "{:,.0f}", "Costo insumos (US$)": "{:,.0f}", "Costo inventario (US$)": "{:,.0f}",
+            "Margen (US$)": "{:,.0f}", "Σ ROP (porc.)": "{:,.0f}", "Σ SS (porc.)": "{:,.0f}",
+            "Σ EOQ (porc.)": "{:,.0f}", "Δ demanda vs E0 (%)": "{:+.1f}", "Δ margen vs E0 (%)": "{:+.1f}"})
+            .apply(lambda f: ["background-color: #E7F0D6" if f.name == reco else "" for _ in f], axis=1),
+            use_container_width=True)
+        st.download_button("⬇️ Descargar escenarios (CSV)", csv_bytes(tabla_esc), "escenarios.csv", "text/csv")
+
+        g1, g2 = st.columns(2)
+        with g1:
+            fig, ax = plt.subplots(figsize=(6.5, 3.8))
+            colores = [COLOR_BASE if n == reco else ("#F4A300" if ok else "#BBBBBB")
+                       for n, ok in tabla_esc["Cumple restricciones"].items()]
+            ax.barh(tabla_esc.index[::-1], tabla_esc["Margen (US$)"][::-1], color=colores[::-1])
+            ax.set_xlabel(f"Margen {horizonte} semanas (US$)")
+            ax.set_title("Margen por escenario (gris = no cumple restricciones)", fontsize=10); estilo(ax)
+            mostrar(fig)
+        with g2:
+            fig, ax = plt.subplots(figsize=(6.5, 3.8))
+            ax.scatter(tabla_esc["Δ demanda vs E0 (%)"], tabla_esc["Margen (US$)"], s=80,
+                       c=colores, edgecolor=COLOR_BASE)
+            etiquetas = {}
+            for n, rr in tabla_esc.iterrows():  # agrupa escenarios que caen en el mismo punto
+                pos = (round(rr["Δ demanda vs E0 (%)"], 1), round(rr["Margen (US$)"] / 50) * 50)
+                etiquetas.setdefault(pos, []).append(n.split(" · ")[0])
+            for (xx, yy), labs in etiquetas.items():
+                ax.annotate(" / ".join(labs), (xx, yy), xytext=(5, 4), textcoords="offset points", fontsize=8)
+            ax.axvline(-caida_max, color=COLOR_ESC, ls="--", lw=1, label="Caída máxima permitida")
+            ax.set_xlabel("Δ demanda vs E0 (%)"); ax.set_ylabel("Margen (US$)")
+            ax.set_title("Trade-off: volumen vs margen", fontsize=10); ax.legend(fontsize=8); estilo(ax)
+            mostrar(fig)
+
+        st.subheader("Recomendación")
+        if reco is None:
+            st.error("Ningún escenario cumple las restricciones. Relaje el fill rate mínimo o la caída máxima de demanda.")
+        else:
+            rr, r0 = tabla_esc.loc[reco], tabla_esc.iloc[0]
+            st.success(
+                f"**Escenario recomendado: {reco}.** Margen de **US$ {rr['Margen (US$)']:,.0f}** en {horizonte} semanas "
+                f"({rr['Δ margen vs E0 (%)']:+.1f} % vs E0), con demanda de {rr['Demanda (pizzas)']:,.0f} pizzas "
+                f"({rr['Δ demanda vs E0 (%)']:+.1f} %) y fill rate de {rr['Fill rate (%)']:.2f} %.")
+            st.markdown(
+                f"- **Compras:** reordenar cuando el stock llegue a **{rr['Σ ROP (porc.)']:,.0f} porciones** en total "
+                f"(con {rr['Σ SS (porc.)']:,.0f} de seguridad) y pedir lotes que suman **{rr['Σ EOQ (porc.)']:,.0f} "
+                "porciones**; el detalle por insumo está en la pestaña Inventario al fijar este escenario en el panel.\n"
+                f"- **Frente a la base:** ingreso {rr['Ingreso (US$)'] - r0['Ingreso (US$)']:+,.0f} US$, costo de "
+                f"inventario {rr['Costo inventario (US$)'] - r0['Costo inventario (US$)']:+,.0f} US$ y "
+                f"{rr['Pizzas perdidas'] - r0['Pizzas perdidas']:+,.1f} pizzas perdidas.\n"
+                f"- **Descartados por restricciones:** "
+                + (", ".join(tabla_esc.index[~tabla_esc["Cumple restricciones"]]) or "ninguno") + ".")
+        st.caption(f"Elasticidad usada: {modo} (panel lateral). La recomendación es un escenario, no una predicción: "
+                   "depende de la elasticidad estimada (no significativa) y de los supuestos de costos.")
+
 # ============================== DEMANDA ======================================
 with tab_dem:
     st.header(f"Proyección de demanda con series de tiempo — {serie_sel}")

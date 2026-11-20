@@ -35,6 +35,9 @@ B) CORRER EN LA COMPUTADORA (Windows)
 PARA LA PRESENTACIÓN
 -----------------------------------------------------------------
 - Desactivar el traductor de Chrome (mezcla comas y puntos).
+- Criterio 3 -> pestaña "Indicadores clave" (7 indicadores, técnica y gráfico).
+- Criterio 4 -> pestaña "Escenarios prescriptivos" (6 escenarios editables,
+  restricciones y recomendación automática).
 - Panel integrado -> "Mapa de dependencias" muestra qué mueve cada parámetro.
 - Demostración sugerida: subir el precio +10 %, luego bajar el nivel de
   servicio a 90 % y subir H: cambian servicio, ingreso, margen y precio óptimo.
