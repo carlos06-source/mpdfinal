@@ -8,7 +8,7 @@ Aplicación única en Streamlit que integra tres modelos conectados entre sí:
 
 Cadena de dependencias (todo se recalcula al mover cualquier parámetro):
   1. El escenario de precios (Δ%) y la elasticidad ε generan un multiplicador de demanda.
-  2. El pronóstico semanal de series de tiempo (Random Forest con rezagos) fija el nivel
+  2. El pronóstico de series de tiempo (Holt-Winters / ARIMA / SARIMA) fija el nivel
      de demanda esperado respecto al histórico (factor g).
   3. Ambos factores escalan el consumo diario de insumos, y con él SS, ROP, EOQ y costos.
 
@@ -24,12 +24,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy import stats
-from sklearn.decomposition import PCA
+import warnings
+
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.model_selection import KFold, cross_val_predict
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import acf as sm_acf, adfuller, pacf
 
 # ----------------------------------------------------------------------------
 # 0. CONFIGURACIÓN GENERAL Y ESTILO
@@ -40,14 +43,17 @@ st.set_page_config(page_title="MPD · Pizzería: Elasticidad + Demanda + Inventa
 PALETA = ["#C1272D", "#F4A300", "#6B8E23", "#8B4513", "#F5D061"]
 COLOR_BASE, COLOR_ESC = "#7A2E0E", "#C1272D"
 
-VARIABLES = ["precio", "semana", "mes", "t", "sin_doy", "cos_doy",
-             "lag_1", "lag_2", "lag_3", "lag_4", "media_4"]
 Z_TABLA = {"90 %": 1.282, "95 %": 1.645, "97.5 %": 1.960, "99 %": 2.326}
 OPC_TOP5 = "Top 5 agregado"
 OPC_TODAS = "Todas las pizzas (pizzería completa)"
-M_RF, M_PCA = "Random Forest (propuesto)", "Random Forest + PCA"
+M_HW, M_ARIMA, M_SARIMA = "Holt-Winters", "ARIMA", "SARIMA"
 M_NAIVE, M_MA4 = "Ingenuo (última semana)", "Media móvil 4 semanas"
+MODELOS_TS = [M_HW, M_ARIMA, M_SARIMA]
+MODELOS_TODOS = [M_NAIVE, M_MA4] + MODELOS_TS
 M_AUTO = "Automático (menor MAPE en backtesting)"
+IDX_DIA = "Diario (order_date) · estacionalidad semanal m = 7"
+IDX_SEM = "Semanal (bloques de 7 días) · ciclo m = 4"
+VARS_Y = {"Unidades (pizzas)": "unidades", "Ventas (US$)": "ventas", "Pedidos": "pedidos"}
 COLUMNAS_REQ = ["order_id", "quantity", "order_date", "unit_price", "total_price",
                 "pizza_size", "pizza_category", "pizza_ingredients", "pizza_name"]
 
@@ -280,60 +286,11 @@ def simular_precio(df_seg: pd.DataFrame, eps: dict, grilla) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# 3. MODELO DE DEMANDA CON SERIES DE TIEMPO
+# 3. MODELO DE DEMANDA CON SERIES DE TIEMPO (descomposición, Holt-Winters, ARIMA, SARIMA)
 # ----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def calcular_top5(_df, clave: str) -> pd.Series:
     return _df.groupby("pizza_name")["quantity"].sum().sort_values(ascending=False).head(5)
-
-
-MIN_DIAS_BORDE = 4  # semanas de inicio/fin de año con menos días se descartan
-
-
-def agregar_semanal(d: pd.DataFrame):
-    """Serie semanal SIN huecos.
-
-    Antes se eliminaban todas las semanas con < 7 días de venta, incluidas semanas del
-    medio del año: eso rompía la continuidad (lag_1 pasaba a ser la semana de hace 2-3
-    semanas y t dejaba de medir tiempo real). Ahora:
-      · solo se recortan las semanas incompletas de los BORDES (inicio/fin) con < 4 días;
-      · las semanas interiores incompletas se mantienen y se normalizan a 7 días
-        (unidades × 7 / días con venta), para que todas midan el mismo ritmo semanal.
-    """
-    tmp = d.set_index("order_date")
-    serie = tmp.resample("W").agg(ventas=("total_price", "sum"), pedidos=("order_id", "nunique"),
-                                  unidades=("quantity", "sum"), precio=("unit_price", "mean"))
-    dias = (d.assign(dia=d["order_date"].dt.normalize()).drop_duplicates("dia")
-            .set_index("dia").resample("W").size())
-    serie["dias_con_venta"] = dias.reindex(serie.index).fillna(0).values
-    ok = serie["dias_con_venta"] >= MIN_DIAS_BORDE
-    if not ok.any():
-        return serie.iloc[0:0].reset_index().rename(columns={"order_date": "fecha"}), len(serie), 0
-    primera, ultima = ok.idxmax(), ok[::-1].idxmax()
-    rec = serie.loc[primera:ultima].copy()
-    n_desc = len(serie) - len(rec)
-    n_ajust = int((rec["dias_con_venta"] < 7).sum())
-    k = 7 / rec["dias_con_venta"].replace(0, np.nan)
-    for c in ["ventas", "pedidos", "unidades"]:
-        rec[c] = rec[c] * k
-    cols = ["ventas", "pedidos", "unidades", "precio"]
-    rec[cols] = rec[cols].interpolate(limit_direction="both")  # semana sin ventas (si existiera)
-    serie = rec.drop(columns="dias_con_venta").reset_index().rename(columns={"order_date": "fecha"})
-    return serie, n_desc, n_ajust
-
-
-def crear_features(serie: pd.DataFrame) -> pd.DataFrame:
-    out = serie.copy()
-    out["t"] = np.arange(len(out))
-    doy = out["fecha"].dt.dayofyear
-    out["sin_doy"] = np.sin(2 * np.pi * doy / 365.25)
-    out["cos_doy"] = np.cos(2 * np.pi * doy / 365.25)
-    out["semana"] = out["fecha"].dt.isocalendar().week.astype(int)
-    out["mes"] = out["fecha"].dt.month
-    for k in range(1, 5):
-        out[f"lag_{k}"] = out["unidades"].shift(k)
-    out["media_4"] = out["unidades"].shift(1).rolling(4).mean()
-    return out.dropna().reset_index(drop=True)
 
 
 def filtrar_alcance(df: pd.DataFrame, productos: tuple, seleccion: str) -> pd.DataFrame:
@@ -346,30 +303,36 @@ def filtrar_alcance(df: pd.DataFrame, productos: tuple, seleccion: str) -> pd.Da
 
 
 @st.cache_data(show_spinner=False)
-def preparar_serie(_d, clave_s: str):
-    d = _d
-    serie, n_desc, n_ajust = agregar_semanal(d)
-    feat = crear_features(serie)
-    pu = d.groupby("pizza_category")["quantity"].sum()
-    pr = d.groupby("pizza_category")["total_price"].sum()
-    precio_unit = float(d["total_price"].sum() / d["quantity"].sum())
-    cols = ["pizza_name", "pizza_category", "pizza_size"]
-    return serie, feat, (n_desc, n_ajust), pu / pu.sum(), pr / pr.sum(), precio_unit, d[cols].copy()
-
-
-def construir_modelo(nombre: str, n_est: int):
-    rf = RandomForestRegressor(n_estimators=n_est, max_depth=8, min_samples_leaf=2,
-                               random_state=42, n_jobs=-1)
-    if nombre == M_PCA:  # reducción de dimensiones (retroalimentación del docente)
-        return make_pipeline(StandardScaler(), PCA(n_components=0.95, svd_solver="full"), rf)
-    return rf
+def pesos_alcance(_d, clave_s: str):
+    """Participación de cada categoría en unidades e ingresos, y precio medio por pizza (US$)."""
+    pu = _d.groupby("pizza_category")["quantity"].sum()
+    pr = _d.groupby("pizza_category")["total_price"].sum()
+    precio_unit = float(_d["total_price"].sum() / _d["quantity"].sum())
+    return pu / pu.sum(), pr / pr.sum(), precio_unit
 
 
 @st.cache_data(show_spinner=False)
-def ajustar_modelo(df_feat, nombre: str, n_est: int):
-    m = construir_modelo(nombre, n_est)
-    m.fit(df_feat[VARIABLES], df_feat["unidades"])
-    return m
+def construir_series(_d, clave_s: str):
+    """Serie DIARIA continua (índice order_date) y serie SEMANAL en bloques de 7 días.
+
+    · Los días sin ventas (local cerrado) se completan por interpolación para que la serie
+      no tenga huecos (los modelos de series de tiempo exigen periodos consecutivos).
+    · Las semanas son bloques de 7 días contados hacia atrás desde la última fecha, así
+      ninguna semana queda incompleta (se descartan solo los días sobrantes del inicio).
+    """
+    dia = _d["order_date"].dt.normalize()
+    g = _d.groupby(dia).agg(unidades=("quantity", "sum"), ventas=("total_price", "sum"),
+                            pedidos=("order_id", "nunique"))
+    idx = pd.date_range(g.index.min(), g.index.max(), freq="D")
+    n_faltantes = len(idx) - len(g)
+    diaria = g.reindex(idx).interpolate(limit_direction="both")
+    sobrantes = len(diaria) % 7
+    diaria = diaria.iloc[sobrantes:].asfreq("D")
+    n_sem = len(diaria) // 7
+    semanal = diaria.groupby(np.repeat(np.arange(n_sem), 7)).sum()
+    semanal.index = pd.DatetimeIndex(diaria.index[6::7], freq="7D")
+    diaria.index.name = semanal.index.name = "fecha"
+    return diaria, semanal, n_faltantes, sobrantes
 
 
 def _mape(real, pred):
@@ -377,68 +340,114 @@ def _mape(real, pred):
     return float(np.mean(np.abs((real - pred) / np.maximum(real, 1))) * 100)
 
 
-@st.cache_data(show_spinner="Ejecutando backtesting…")
-def backtest(df_feat, nombre: str, n_est: int, horizonte=4, paso=4):
-    min_train = 28 if len(df_feat) >= 36 else max(10, len(df_feat) // 2)
-    fechas, reales, preds = [], [], []
-    for corte in range(min_train, len(df_feat) - horizonte + 1, paso):
-        tr, te = df_feat.iloc[:corte], df_feat.iloc[corte:corte + horizonte]
-        if nombre == M_NAIVE:
-            p = te["lag_1"].values
-        elif nombre == M_MA4:
-            p = te["media_4"].values
-        else:
-            m = construir_modelo(nombre, n_est).fit(tr[VARIABLES], tr["unidades"])
-            p = m.predict(te[VARIABLES])
-        preds.extend(np.asarray(p, float)); reales.extend(te["unidades"].tolist()); fechas.extend(te["fecha"].tolist())
-    preds, reales = np.array(preds), np.array(reales, float)
-    mae = float(np.mean(np.abs(reales - preds)))
-    rmse = float(np.sqrt(np.mean((reales - preds) ** 2)))
-    return mae, rmse, _mape(reales, preds), pd.DataFrame({"fecha": fechas, "real": reales, "prediccion": preds.round(1)})
+def _metricas(real, pred):
+    real, pred = np.asarray(real, float), np.asarray(pred, float)
+    return (float(np.mean(np.abs(real - pred))), float(np.sqrt(np.mean((real - pred) ** 2))), _mape(real, pred))
 
 
-def pronosticar(df_feat, modelo, horizonte: int) -> pd.DataFrame:
-    """Pronóstico recursivo: cada predicción alimenta los rezagos de la semana siguiente."""
-    hist = df_feat["unidades"].tolist()
-    ultima, t_act = df_feat["fecha"].iloc[-1], int(df_feat["t"].iloc[-1])
-    precio_ref = float(df_feat["precio"].tail(4).mean())
-    fechas, preds = [], []
-    for paso in range(1, horizonte + 1):
-        f = ultima + pd.Timedelta(weeks=paso)
-        t_act += 1
-        doy = f.dayofyear
-        fila = pd.DataFrame([{"precio": precio_ref, "semana": int(f.isocalendar()[1]), "mes": f.month,
-                              "t": t_act, "sin_doy": np.sin(2 * np.pi * doy / 365.25),
-                              "cos_doy": np.cos(2 * np.pi * doy / 365.25),
-                              "lag_1": hist[-1], "lag_2": hist[-2], "lag_3": hist[-3], "lag_4": hist[-4],
-                              "media_4": float(np.mean(hist[-4:]))}])[VARIABLES]
-        y = float(modelo.predict(fila)[0])
-        hist.append(y); fechas.append(f); preds.append(y)
-    return pd.DataFrame({"fecha": fechas, "prediccion": np.round(preds, 1)})
+def _sarimax(y, orden, estacional=(0, 0, 0, 0)):
+    tendencia = "c" if (orden[1] == 0 and estacional[1] == 0) else "n"
+    return SARIMAX(y, order=orden, seasonal_order=estacional, trend=tendencia,
+                   enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
 
 
-@st.cache_data(show_spinner=False)
-def importancias_rf(df_feat, n_est: int) -> pd.Series:
-    m = construir_modelo(M_RF, n_est).fit(df_feat[VARIABLES], df_feat["unidades"])
-    return pd.Series(m.feature_importances_, index=VARIABLES).sort_values(ascending=False)
+def seleccionar_ordenes(y: pd.Series, m: int) -> dict:
+    """Búsqueda por AIC (menor es mejor) de los órdenes ARIMA(p,d,q) y SARIMA(P,D,Q)m."""
+    mejor_a, aic_a = (1, 0, 0), np.inf
+    for p in range(3):
+        for d in range(2):
+            for q in range(3):
+                try:
+                    aic = _sarimax(y, (p, d, q)).aic
+                except Exception:  # noqa: BLE001
+                    continue
+                if aic < aic_a:
+                    mejor_a, aic_a = (p, d, q), aic
+    mejor_s, aic_s = (0, 0, 0, m), np.inf
+    for P, D, Q in [(1, 0, 0), (0, 0, 1), (1, 0, 1), (0, 1, 1), (1, 1, 1)]:
+        try:
+            aic = _sarimax(y, mejor_a, (P, D, Q, m)).aic
+        except Exception:  # noqa: BLE001
+            continue
+        if aic < aic_s:
+            mejor_s, aic_s = (P, D, Q, m), aic
+    return {"arima": mejor_a, "aic_arima": aic_a, "sarima": (mejor_a, mejor_s), "aic_sarima": aic_s}
 
 
-@st.cache_data(show_spinner=False)
-def info_pca(df_feat):
-    Xs = StandardScaler().fit_transform(df_feat[VARIABLES])
-    p = PCA().fit(Xs)
-    return p.explained_variance_ratio_, pd.DataFrame(p.components_[:3].T, index=VARIABLES, columns=["CP1", "CP2", "CP3"])
+def ajustar_ts(y: pd.Series, nombre: str, m: int, ordenes: dict):
+    if nombre == M_HW:
+        return ExponentialSmoothing(y, trend="add", damped_trend=True, seasonal="add", seasonal_periods=m,
+                                    initialization_method="estimated").fit()
+    if nombre == M_ARIMA:
+        return _sarimax(y, ordenes["arima"])
+    return _sarimax(y, *ordenes["sarima"])
 
 
-def acf(x, nlags=12):
-    x = np.asarray(x, float) - np.mean(x)
-    den = (x ** 2).sum()
-    return np.array([(x[:-k] * x[k:]).sum() / den for k in range(1, nlags + 1)])
+def predecir_bloques(y, nombre, m, ordenes, pasos, agrupar):
+    """Pronostica 'pasos' periodos y, si la serie es diaria, los suma en bloques de 7 días."""
+    if nombre == M_NAIVE:
+        base = y.iloc[-agrupar:].sum()
+        return np.repeat(base, pasos // agrupar)
+    if nombre == M_MA4:
+        base = y.iloc[-4 * agrupar:].sum() / 4
+        return np.repeat(base, pasos // agrupar)
+    f = np.asarray(ajustar_ts(y, nombre, m, ordenes).forecast(pasos), float)
+    return f.reshape(-1, agrupar).sum(axis=1)
+
+
+@st.cache_data(show_spinner="Ajustando modelos de series de tiempo…")
+def modelos_series(_d, clave_s: str, indice: str, variable: str, horizonte: int):
+    """Ajusta y valida Holt-Winters, ARIMA y SARIMA (más dos referencias simples) sobre la serie elegida.
+    Todo error se mide en SEMANAS (bloques de 7 días) para que los índices diario y semanal sean comparables."""
+    warnings.filterwarnings("ignore")
+    diaria, semanal, n_falt, sobr = construir_series(_d, clave_s)
+    diario = indice == IDX_DIA
+    y = (diaria if diario else semanal)[variable].astype(float)
+    m = 7 if diario else 4                 # estacionalidad: día de la semana (diaria) o ciclo de 4 semanas
+    agrupar = 7 if diario else 1           # periodos por semana
+    h_bt = 4 * agrupar                      # backtesting: 4 semanas por corte
+    min_train = 28 * agrupar                # al menos 28 semanas de entrenamiento
+    ordenes = seleccionar_ordenes(y.iloc[:min_train], m)   # órdenes elegidos SOLO con el primer tramo
+
+    reales_sem = semanal[variable].astype(float)
+    filas, tablas = [], {}
+    for nombre in MODELOS_TODOS:
+        fechas, reales, preds = [], [], []
+        for corte in range(min_train, len(y) - h_bt + 1, h_bt):
+            try:
+                p = predecir_bloques(y.iloc[:corte], nombre, m, ordenes, h_bt, agrupar)
+            except Exception:  # noqa: BLE001
+                p = np.full(4, np.nan)
+            k = corte // agrupar
+            reales.extend(reales_sem.iloc[k:k + 4].tolist()); preds.extend(p)
+            fechas.extend(reales_sem.index[k:k + 4])
+        tb = pd.DataFrame({"fecha": fechas, "real": reales, "prediccion": np.round(preds, 1)}).dropna()
+        tablas[nombre] = tb
+        mae, rmse, mape = _metricas(tb["real"], tb["prediccion"]) if len(tb) else (np.nan,) * 3
+        filas.append({"Modelo": nombre, "MAE": mae, "RMSE": rmse, "MAPE (%)": mape, "Folds": len(tb) // 4})
+    comp = pd.DataFrame(filas).set_index("Modelo")
+
+    # Pronóstico final: cada modelo se reajusta con TODA la serie y proyecta 'horizonte' semanas
+    futuros = pd.DatetimeIndex([semanal.index[-1] + pd.Timedelta(days=7 * k) for k in range(1, horizonte + 1)])
+    pron, ajustados = {}, {}
+    for nombre in MODELOS_TODOS:
+        try:
+            pron[nombre] = predecir_bloques(y, nombre, m, ordenes, horizonte * agrupar, agrupar)
+            if nombre in MODELOS_TS:
+                ajustados[nombre] = ajustar_ts(y, nombre, m, ordenes).fittedvalues
+        except Exception:  # noqa: BLE001
+            pron[nombre] = np.full(horizonte, np.nan)
+    pron = pd.DataFrame(pron, index=futuros)
+
+    deco = seasonal_decompose(y, model="additive", period=m)
+    adf_p = float(adfuller(y.dropna())[1])
+    return {"y": y, "semanal": semanal, "m": m, "ordenes": ordenes, "comp": comp, "tablas": tablas,
+            "pron": pron, "ajustados": ajustados, "deco": deco, "adf_p": adf_p,
+            "acf": sm_acf(y, nlags=2 * m), "pacf": pacf(y, nlags=2 * m), "n_faltantes": n_falt, "sobrantes": sobr}
 
 
 def descriptivos(df, columnas, moda_en=None) -> pd.DataFrame:
-    """moda_en: columnas donde la moda tiene sentido (las demás muestran vacío, p. ej. t o
-    sin_doy, donde todos los valores son distintos y la 'moda' sería solo el mínimo)."""
+    """moda_en: columnas donde la moda tiene sentido (en variables continuas casi nunca se repite un valor)."""
     filas = []
     for c in columnas:
         s = pd.to_numeric(df[c], errors="coerce").dropna()
@@ -448,8 +457,6 @@ def descriptivos(df, columnas, moda_en=None) -> pd.DataFrame:
         filas.append({"Variable": c, "Media": s.mean(), "Moda": moda.iloc[0] if len(moda) else np.nan,
                       "Desv. estándar": s.std(), "Mínimo": s.min(), "Máximo": s.max()})
     return pd.DataFrame(filas).set_index("Variable").round(3)
-
-
 # ----------------------------------------------------------------------------
 # 4. MODELO DE INVENTARIO (REVISIÓN CONTINUA, s-Q)
 # ----------------------------------------------------------------------------
@@ -549,9 +556,14 @@ if all(v == 0 for v in deltas.values()):
 st.sidebar.subheader("📈 2 · Demanda (series de tiempo)")
 serie_sel = st.sidebar.selectbox("Alcance / serie a pronosticar", [OPC_TOP5, OPC_TODAS] + list(productos_top5),
                                  help="Define qué pizzas entran en el pronóstico Y en el inventario (mismo alcance).")
-modelo_sel = st.sidebar.selectbox("Modelo de pronóstico", [M_AUTO, M_RF, M_PCA])
+indice_sel = st.sidebar.selectbox("Índice temporal", [IDX_DIA, IDX_SEM],
+                                  help="Diario: un dato por día (order_date), capta el patrón por día de la semana. "
+                                       "Semanal: suma de bloques de 7 días.")
+var_label = st.sidebar.selectbox("Variable a proyectar (pestaña Demanda)", list(VARS_Y.keys()),
+                                 help="El sistema integrado (inventario, ingreso, margen) usa siempre unidades.")
+var_sel = VARS_Y[var_label]
+modelo_sel = st.sidebar.selectbox("Modelo de pronóstico", [M_AUTO] + MODELOS_TS)
 horizonte = st.sidebar.slider("Horizonte (semanas)", 4, 12, 8)
-n_est = st.sidebar.slider("Árboles del Random Forest", 100, 500, 300, 50)
 aplicar_pron = st.sidebar.checkbox("Propagar el pronóstico al inventario", value=True)
 
 st.sidebar.subheader("📦 3 · Inventario (revisión continua)")
@@ -581,14 +593,17 @@ d_scope = filtrar_alcance(df, productos_top5, serie_sel)
 clave_s = f"{clave}|{serie_sel}"
 cats_scope = sorted(d_scope["pizza_category"].unique())
 
-# --- Demanda (series de tiempo)
-serie, df_feat, (n_desc, n_ajust), pes_u, pes_r, precio_unit, d_ser = preparar_serie(d_scope, clave_s)
-bt_res = {n: backtest(df_feat, n, n_est) for n in [M_NAIVE, M_MA4, M_RF, M_PCA]}
-modelo_usado = min([M_RF, M_PCA], key=lambda n: bt_res[n][2]) if modelo_sel == M_AUTO else modelo_sel
-mejor_global = min(bt_res, key=lambda n: bt_res[n][2])
-modelo_fit = ajustar_modelo(df_feat, modelo_usado, n_est)
-fc = pronosticar(df_feat, modelo_fit, horizonte)
-media_hist = float(serie["unidades"].mean())
+# --- Demanda (series de tiempo): el sistema integrado siempre proyecta UNIDADES
+pes_u, pes_r, precio_unit = pesos_alcance(d_scope, clave_s)
+ts_u = modelos_series(d_scope, clave_s, indice_sel, "unidades", horizonte)
+ts_v = ts_u if var_sel == "unidades" else modelos_series(d_scope, clave_s, indice_sel, var_sel, horizonte)
+bt_res = {n: (r["MAE"], r["RMSE"], r["MAPE (%)"], ts_u["tablas"][n]) for n, r in ts_u["comp"].iterrows()}
+validos = [n for n in MODELOS_TS if np.isfinite(bt_res[n][2])]
+modelo_usado = (min(validos, key=lambda n: bt_res[n][2]) if modelo_sel == M_AUTO else modelo_sel)
+mejor_global = min(bt_res, key=lambda n: bt_res[n][2] if np.isfinite(bt_res[n][2]) else np.inf)
+serie_sem = ts_u["semanal"]
+fc = pd.DataFrame({"fecha": ts_u["pron"].index, "prediccion": ts_u["pron"][modelo_usado].round(1).values})
+media_hist = float(serie_sem["unidades"].mean())
 g_pron = float(fc["prediccion"].mean() / media_hist) if aplicar_pron else 1.0
 pron_total = float(fc["prediccion"].sum())
 
@@ -704,13 +719,13 @@ with tab_panel:
     cA, cB = st.columns([3, 2])
     with cA:
         st.subheader("Demanda semanal: histórico, base y escenario")
-        hist = df_feat[["fecha", "unidades"]].tail(16)
+        hist = serie_sem["unidades"].tail(16).reset_index()
         fig, ax = plt.subplots(figsize=(8.5, 3.8))
         ax.plot(hist["fecha"], hist["unidades"], marker="o", color=COLOR_BASE, label="Histórico")
         ax.plot(fc["fecha"], fc["prediccion"], marker="o", ls="--", color="#F4A300", label="Pronóstico base")
         ax.plot(fc["fecha"], fc["escenario"], marker="s", color=COLOR_ESC, label="Demanda escenario (precio)")
         ax.plot(fc["fecha"], fc["vendidas"], ls=":", color="#6B8E23", label="Vendidas (tras faltantes)")
-        ax.axvline(df_feat["fecha"].iloc[-1], color="#6B8E23", ls=":")
+        ax.axvline(serie_sem.index[-1], color="#6B8E23", ls=":")
         ax.set_ylabel("Pizzas por semana"); ax.legend(fontsize=8); estilo(ax)
         mostrar(fig)
     with cB:
@@ -746,7 +761,7 @@ with tab_panel:
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | Δ precio (global / categoría) | ✔ | ✔ | ✔ | ✔ | ✔ | — |
 | Elasticidad (modo / ε) | ✔ si Δ ≠ 0 | ✔ si Δ ≠ 0 | ✔ si Δ ≠ 0 | ✔ si Δ ≠ 0 | ✔ si Δ ≠ 0 | ✔ |
-| Alcance / serie, modelo, horizonte, árboles | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Alcance, índice temporal, modelo, horizonte | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
 | N.º de insumos | — | ✔ | ✔ | ✔ | ✔ | ✔ |
 | Lead time L, nivel de servicio | — | ✔ | ✔ | ✔ | ✔ | ✔ |
 | Costos S y H | — | ✔ | ✔ | ✔ | ✔ | ✔ |
@@ -771,7 +786,7 @@ with tab_ind:
          "Técnica analítica": f"Series de tiempo · {modelo_usado} (pronóstico recursivo)",
          "Lectura": f"Promedio de {R['dem'] / horizonte:,.0f} pizzas por semana"},
         {"Indicador": "Error del pronóstico (MAPE)", "Valor": f"{mape_u:.2f} %",
-         "Técnica analítica": "Backtesting con ventana expansiva",
+         "Técnica analítica": "Backtesting con origen móvil (4 semanas por corte)",
          "Lectura": "Margen de error esperado al planificar compras"},
         {"Indicador": "Punto de reorden total (Σ ROP)", "Valor": f"{R['met']['ROP'].sum():,.0f} porciones",
          "Técnica analítica": "Modelo de inventario de revisión continua (s, Q)",
@@ -812,7 +827,7 @@ with tab_ind:
     j1, j2 = st.columns([3, 2])
     with j1:
         fig, ax = plt.subplots(figsize=(7.5, 3.4))
-        h16 = df_feat[["fecha", "unidades"]].tail(16)
+        h16 = serie_sem["unidades"].tail(16).reset_index()
         ax.plot(h16["fecha"], h16["unidades"], marker="o", color=COLOR_BASE, label="Histórico")
         ax.plot(fc["fecha"], fc["prediccion"], marker="o", ls="--", color="#F4A300", label="Pronóstico")
         ax.fill_between(fc["fecha"], fc["prediccion"] * (1 - mape_u / 100), fc["prediccion"] * (1 + mape_u / 100),
@@ -999,101 +1014,133 @@ with tab_esc:
 # ============================== DEMANDA ======================================
 with tab_dem:
     st.header(f"Proyección de demanda con series de tiempo — {serie_sel}")
-    st.write(f"Modelo usado: **{modelo_usado}**"
+    tv = ts_v
+    bt_v = tv["comp"]
+    val_v = [n for n in MODELOS_TS if np.isfinite(bt_v.loc[n, "MAPE (%)"])]
+    modelo_v = min(val_v, key=lambda n: bt_v.loc[n, "MAPE (%)"]) if modelo_sel == M_AUTO else modelo_sel
+    es_diario = indice_sel == IDX_DIA
+    unidad_t = "día" if es_diario else "semana"
+    st.write(f"Variable proyectada: **{var_label}** · índice temporal: **{indice_sel}** · modelo: **{modelo_v}**"
              + (" (elegido automáticamente por menor MAPE)" if modelo_sel == M_AUTO else "")
-             + f" · {n_est} árboles · horizonte de {horizonte} semanas. "
-             "Variable objetivo: unidades semanales; predictores: precio, calendario, rezagos y media móvil.")
+             + f" · horizonte: **{horizonte} semanas**.")
     if serie_sel == OPC_TOP5:
         st.write("Top 5 por unidades: " + ", ".join(f"**{p}** ({int(u):,})" for p, u in top5.items()))
-    if n_desc or n_ajust:
-        st.info(f"Serie continua de {len(serie)} semanas: se recortaron {n_desc} semana(s) de borde con menos de "
-                f"{MIN_DIAS_BORDE} días de datos y {n_ajust} semana(s) interiores con días sin venta se normalizaron "
-                "a 7 días (unidades × 7 ÷ días con venta). Así no hay huecos y los rezagos son semanas consecutivas.")
+    st.info(f"Preparación: serie continua de {len(tv['y'])} periodos ({unidad_t}). Se completaron por interpolación "
+            f"{tv['n_faltantes']} día(s) sin ventas y se descartaron {tv['sobrantes']} día(s) iniciales para formar "
+            "semanas completas de 7 días. Así no hay huecos ni semanas incompletas.")
 
-    s1, s2 = st.columns(2)
-    with s1:
-        fig, ax = plt.subplots(figsize=(7, 3.4))
-        ax.plot(serie["fecha"], serie["unidades"], color=COLOR_ESC, marker=".")
-        ax.set_title("Serie semanal de unidades"); ax.set_ylabel("Unidades"); estilo(ax)
-        mostrar(fig)
-    with s2:
-        a = acf(df_feat["unidades"].values, 12)
-        fig, ax = plt.subplots(figsize=(7, 3.4))
-        ax.bar(range(1, 13), a, color="#F4A300")
-        lim = 1.96 / np.sqrt(len(df_feat))
-        ax.axhline(lim, color="gray", ls="--", lw=1); ax.axhline(-lim, color="gray", ls="--", lw=1)
-        ax.set_title("Autocorrelación (ACF) — justifica el uso de rezagos"); ax.set_xlabel("Rezago (semanas)")
-        estilo(ax); mostrar(fig)
+    # 1 · Serie y descriptivos
+    st.subheader("1 · Serie de tiempo y análisis descriptivo")
+    fig, ax = plt.subplots(figsize=(12, 3.4))
+    ax.plot(tv["y"].index, tv["y"].values, color=COLOR_BASE, lw=1, label=f"{var_label} (real)")
+    if modelo_v in tv["ajustados"]:
+        aj = tv["ajustados"][modelo_v].iloc[tv["m"]:]
+        ax.plot(aj.index, aj.values, color="#F4A300", lw=1, alpha=0.9, label=f"Ajuste {modelo_v}")
+    ax.set_ylabel(f"{var_label} por {unidad_t}"); ax.legend(fontsize=8); estilo(ax)
+    mostrar(fig)
+    dd1, dd2 = st.columns(2)
+    with dd1:
+        st.markdown("**Variables numéricas** (media, moda, desviación estándar, mínimo, máximo)")
+        base_d = construir_series(d_scope, clave_s)[0].add_suffix(" / día")
+        base_s = tv["semanal"].add_suffix(" / semana")
+        st.dataframe(pd.concat([descriptivos(base_d, base_d.columns), descriptivos(base_s, base_s.columns)]))
+    with dd2:
+        st.markdown("**Variables categóricas** (moda y su frecuencia)")
+        st.dataframe(pd.DataFrame([{"Variable": c, "Moda": d_scope[c].mode().iloc[0],
+                                    "Frecuencia de la moda (%)": round((d_scope[c] == d_scope[c].mode().iloc[0]).mean() * 100, 1),
+                                    "N.º categorías": d_scope[c].nunique()}
+                                   for c in ["pizza_name", "pizza_category", "pizza_size"]]).set_index("Variable"))
 
-    st.subheader("Variables de entrada y estadística descriptiva")
-    st.dataframe(df_feat[["fecha", "unidades"] + VARIABLES].head(10))
-    st.dataframe(descriptivos(df_feat, ["unidades"] + VARIABLES, moda_en={"unidades", "mes"}))
-    st.caption("La moda solo se reporta donde tiene sentido; en t, semana o sin/cos todos los valores son distintos.")
-    cats_tab = pd.DataFrame([{"Variable": c, "Moda": d_ser[c].mode().iloc[0],
-                              "Frecuencia de la moda (%)": round((d_ser[c] == d_ser[c].mode().iloc[0]).mean() * 100, 1),
-                              "N.º categorías": d_ser[c].nunique()} for c in ["pizza_name", "pizza_category", "pizza_size"]]
-                            ).set_index("Variable")
-    st.dataframe(cats_tab)
+    # 2 · Descomposición
+    st.subheader(f"2 · Descomposición aditiva (periodo m = {tv['m']})")
+    deco = tv["deco"]
+    fig, axes = plt.subplots(1, 3, figsize=(14, 3.2))
+    for ax, comp, tit, col in [(axes[0], deco.trend, "Tendencia", COLOR_BASE),
+                               (axes[1], deco.seasonal.iloc[:4 * tv["m"]], "Estacionalidad (4 ciclos)", "#F4A300"),
+                               (axes[2], deco.resid, "Residuo", "#6B8E23")]:
+        ax.plot(comp.index, comp.values, color=col, lw=1.2); ax.set_title(tit, fontsize=10)
+        ax.tick_params(axis="x", labelsize=7, rotation=30); estilo(ax)
+    mostrar(fig)
+    amp = float(deco.seasonal.max() - deco.seasonal.min())
+    if es_diario:
+        perfil = deco.seasonal.groupby(deco.seasonal.index.dayofweek).mean()
+        dias_n = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+        st.caption(f"Amplitud estacional ≈ {amp:,.1f} por día. Día más alto: **{dias_n[int(perfil.idxmax())]}** "
+                   f"({perfil.max():+.1f}); más bajo: **{dias_n[int(perfil.idxmin())]}** ({perfil.min():+.1f}) "
+                   "respecto a la tendencia.")
+    else:
+        st.caption(f"Amplitud del ciclo de 4 semanas ≈ {amp:,.1f}. Con un solo año de datos no se puede estimar la "
+                   "estacionalidad anual (se necesitan al menos dos ciclos de 52 semanas).")
 
-    imp = importancias_rf(df_feat, n_est)
-    claves = ["unidades"] + imp.head(3).index.tolist()
-    fig, axes = plt.subplots(2, 4, figsize=(14, 5))
-    for j, v in enumerate(claves):
-        axes[0, j].hist(df_feat[v], bins=12, color="#F4A300", edgecolor=COLOR_BASE)
-        axes[0, j].set_title(f"Histograma — {v}", fontsize=9)
-        bp = axes[1, j].boxplot(df_feat[v], vert=False, patch_artist=True)
-        bp["boxes"][0].set_facecolor(COLOR_ESC); bp["boxes"][0].set_alpha(0.6)
-        axes[1, j].set_title(f"Diagrama de caja — {v}", fontsize=9); axes[1, j].set_yticks([])
-        estilo(axes[0, j]); estilo(axes[1, j])
+    # 3 · Estacionariedad y autocorrelación
+    st.subheader("3 · Estacionariedad y autocorrelación")
+    e1, e2, e3 = st.columns([1, 2, 2])
+    e1.metric("ADF p-valor", f"{tv['adf_p']:.4f}")
+    e1.caption("Estacionaria al 5 %" if tv["adf_p"] < 0.05 else "No estacionaria: conviene diferenciar (d ≥ 1)")
+    lim = 1.96 / np.sqrt(len(tv["y"]))
+    for colw, vals, tit in [(e2, tv["acf"][1:], "ACF"), (e3, tv["pacf"][1:], "PACF")]:
+        with colw:
+            fig, ax = plt.subplots(figsize=(6, 2.8))
+            ax.bar(range(1, len(vals) + 1), vals, color="#F4A300")
+            ax.axhline(lim, color="gray", ls="--", lw=1); ax.axhline(-lim, color="gray", ls="--", lw=1)
+            ax.set_title(f"{tit} (rezagos en {unidad_t}s)", fontsize=10); estilo(ax)
+            mostrar(fig)
+
+    # 4 · Modelos
+    st.subheader("4 · Modelos de series de tiempo ajustados")
+    o = tv["ordenes"]
+    st.dataframe(pd.DataFrame([
+        {"Modelo": M_HW, "Especificación": f"Tendencia aditiva amortiguada + estacionalidad aditiva (m = {tv['m']})",
+         "Selección": "Parámetros α, β, γ, φ por máxima verosimilitud"},
+        {"Modelo": M_ARIMA, "Especificación": f"ARIMA{o['arima']}",
+         "Selección": f"Menor AIC en rejilla p,q ∈ {{0,1,2}}, d ∈ {{0,1}} (AIC = {o['aic_arima']:,.1f})"},
+        {"Modelo": M_SARIMA, "Especificación": f"SARIMA{o['sarima'][0]}×{o['sarima'][1][:3]}{o['sarima'][1][3]}",
+         "Selección": f"Menor AIC sobre la parte estacional (AIC = {o['aic_sarima']:,.1f})"},
+    ]).set_index("Modelo"), use_container_width=True)
+    st.caption("Los órdenes se eligen solo con el primer tramo de entrenamiento (28 semanas), para no usar "
+               "información del periodo de prueba.")
+
+    # 5 · Validación
+    st.subheader("5 · Validación: backtesting con origen móvil")
+    st.caption("Se entrena con al menos 28 semanas, se pronostican las 4 siguientes y se avanza 4 semanas; el error "
+               "se mide siempre en totales semanales, así los índices diario y semanal son comparables.")
+    st.dataframe(bt_v.round(2), use_container_width=True)
+    mejor_v = bt_v["MAPE (%)"].idxmin()
+    st.success(f"Menor MAPE: **{mejor_v}** ({bt_v.loc[mejor_v, 'MAPE (%)']:.2f} %). "
+               f"Modelo usado: **{modelo_v}** ({bt_v.loc[modelo_v, 'MAPE (%)']:.2f} %).")
+    if bt_v.loc[[M_NAIVE, M_MA4], "MAPE (%)"].min() < bt_v.loc[modelo_v, "MAPE (%)"]:
+        st.warning("Una referencia simple tiene menor error que el modelo usado: la serie tiene poca estructura "
+                   "semanal-a-semanal que explotar con un solo año de datos.")
+    tb = tv["tablas"][modelo_v]
+    fig, ax = plt.subplots(figsize=(12, 3.4))
+    ax.plot(tb["fecha"], tb["real"], marker="o", color=COLOR_ESC, label="Real (semanal)")
+    ax.plot(tb["fecha"], tb["prediccion"], marker="o", color="#F4A300", label=f"Predicción — {modelo_v}")
+    ax.set_ylabel(f"{var_label} por semana"); ax.legend(fontsize=8); estilo(ax)
     mostrar(fig)
 
-    st.subheader("Reducción de dimensiones (PCA) e importancia de variables")
-    evr, carg = info_pca(df_feat)
-    p1, p2 = st.columns(2)
-    with p1:
-        fig, ax = plt.subplots(figsize=(6, 3.4))
-        ax.bar(range(1, len(evr) + 1), evr.cumsum() * 100, color="#6B8E23")
-        ax.axhline(95, color=COLOR_ESC, ls="--"); ax.set_xlabel("N.º de componentes")
-        ax.set_ylabel("Varianza acumulada (%)"); ax.set_title("PCA sobre las 11 variables"); estilo(ax)
-        mostrar(fig)
-        n95 = int(np.searchsorted(evr.cumsum(), 0.95) + 1)
-        st.caption(f"Con {n95} componentes se retiene ≥ 95 % de la varianza (variante «Random Forest + PCA»).")
-    with p2:
-        fig, ax = plt.subplots(figsize=(6, 3.4))
-        ax.barh(imp.index[::-1], imp.values[::-1], color=COLOR_ESC)
-        ax.set_title("Importancia de variables (Random Forest)"); estilo(ax)
-        mostrar(fig)
-
-    st.subheader("Validación: backtesting con ventana expansiva")
-    st.caption("Entrenamiento mínimo de 28 semanas, horizonte de 4 y paso de 4; se compara contra dos referencias simples.")
-    comp_bt = pd.DataFrame([{"Modelo": n, "MAE": r[0], "RMSE": r[1], "MAPE (%)": r[2]}
-                            for n, r in bt_res.items()]).set_index("Modelo").round(2)
-    st.dataframe(comp_bt)
-    st.success(f"Menor MAPE en el backtesting: **{mejor_global}** ({comp_bt.loc[mejor_global, 'MAPE (%)']:.2f} %). "
-               f"Modelo usado para el pronóstico: **{modelo_usado}** ({comp_bt.loc[modelo_usado, 'MAPE (%)']:.2f} %).")
-    if comp_bt.loc[M_MA4, "MAPE (%)"] < comp_bt.loc[modelo_usado, "MAPE (%)"]:
-        st.warning("La media móvil de 4 semanas tiene menor error que el modelo usado: con un solo año de datos, "
-                   "el modelo de machine learning aún no supera a una referencia simple en esta serie.")
-    st.caption("En «Random Forest + PCA», el escalado y el PCA se ajustan dentro de cada fold (pipeline), "
-               "solo con la parte de entrenamiento: no hay fuga de información hacia la prueba.")
-    tb = bt_res[modelo_usado][3]
-    fig, ax = plt.subplots(figsize=(10, 3.6))
-    ax.plot(tb["fecha"], tb["real"], marker="o", color=COLOR_ESC, label="Real")
-    ax.plot(tb["fecha"], tb["prediccion"], marker="o", color="#F4A300", label=f"Predicción — {modelo_usado}")
-    ax.legend(); ax.set_ylabel("Unidades"); estilo(ax)
+    # 6 · Pronóstico
+    st.subheader(f"6 · Pronóstico a {horizonte} semanas — {var_label}")
+    pv = tv["pron"][MODELOS_TS].round(1)
+    fig, ax = plt.subplots(figsize=(12, 3.6))
+    hs = tv["semanal"][var_sel].tail(16)
+    ax.plot(hs.index, hs.values, marker="o", color=COLOR_BASE, label="Histórico (semanal)")
+    for n, col in zip(MODELOS_TS, ["#6B8E23", "#2b83ba", COLOR_ESC]):
+        ax.plot(pv.index, pv[n], marker="o", ls="--", color=col, lw=2.5 if n == modelo_v else 1, label=n)
+    ax.axvline(hs.index[-1], color="gray", ls=":")
+    ax.set_ylabel(f"{var_label} por semana"); ax.legend(fontsize=8); estilo(ax)
     mostrar(fig)
+    tabla_pv = pv.copy(); tabla_pv.index = tabla_pv.index.strftime("%d/%m/%Y"); tabla_pv.index.name = "Semana (fin)"
+    st.dataframe(tabla_pv, use_container_width=True)
+    st.download_button("⬇️ Descargar pronósticos (CSV)", csv_bytes(tabla_pv), "pronosticos.csv", "text/csv")
 
-    st.subheader(f"Pronóstico recursivo a {horizonte} semanas")
-    tabla_fc = fc.rename(columns={"fecha": "Semana", "prediccion": "Unidades (base)",
-                                  "escenario": "Unidades (escenario precio)",
-                                  "ingreso_base": "Ingreso base ($)", "ingreso_escenario": "Ingreso escenario ($)"})
-    tabla_fc["Semana"] = tabla_fc["Semana"].dt.strftime("%d/%m/%Y")
-    tabla_fc[["Ingreso base ($)", "Ingreso escenario ($)"]] = tabla_fc[["Ingreso base ($)", "Ingreso escenario ($)"]].round(0)
-    st.dataframe(tabla_fc.set_index("Semana"))
-    st.download_button("⬇️ Descargar pronóstico (CSV)", csv_bytes(tabla_fc.set_index("Semana")), "pronostico.csv", "text/csv")
-    st.caption("Supuesto: el precio de referencia del modelo es el promedio de las últimas 4 semanas. "
-               "El efecto de un cambio de precio se incorpora mediante la elasticidad (columna «escenario»). "
-               "El error tiende a acumularse en los últimos pasos porque los rezagos son predicciones previas.")
+    st.markdown(f"**Pronóstico que usa el sistema integrado (unidades, {modelo_usado}) y escenario de precio:**")
+    tabla_fc = fc.rename(columns={"fecha": "Semana (fin)", "prediccion": "Unidades (base)",
+                                  "escenario": "Unidades (escenario precio)", "vendidas": "Vendidas (tras faltantes)",
+                                  "ingreso_base": "Ingreso base (US$)", "ingreso_escenario": "Ingreso escenario (US$)"})
+    tabla_fc["Semana (fin)"] = tabla_fc["Semana (fin)"].dt.strftime("%d/%m/%Y")
+    st.dataframe(tabla_fc.set_index("Semana (fin)").round(1), use_container_width=True)
+    st.caption("El efecto de un cambio de precio entra por la elasticidad (columna «escenario»), no por el modelo "
+               "de series de tiempo, para no contarlo dos veces.")
 
 # ============================== ELASTICIDAD ==================================
 with tab_el:
@@ -1251,11 +1298,12 @@ with tab_met:
 **Elasticidad.** OLS log-log sobre variantes (pizza × categoría × tamaño):
 `ln(cantidad) = β₀ + ε·ln(precio) + tamaño + categoría`. Benchmarks: Ridge y Random Forest.
 
-**Demanda.** Serie semanal continua: se recortan solo las semanas incompletas de los bordes del año y las
-semanas interiores con días sin venta se normalizan a 7 días, para no romper los rezagos. Variables de
-calendario, rezagos 1–4 y media móvil. Random Forest (300 árboles, profundidad 8) con backtesting de ventana
-expansiva y pronóstico recursivo. Se añade una variante con **PCA** (ajustada dentro de cada fold) y dos
-referencias simples (ingenuo y media móvil); en modo automático se usa el modelo de ML con menor MAPE.
+**Demanda (series de tiempo).** Serie diaria continua (índice order_date; días sin ventas interpolados) o
+semanal (bloques de 7 días). Se analiza con **descomposición aditiva**, prueba **ADF** de estacionariedad y
+**ACF/PACF**, y se ajustan tres modelos: **Holt-Winters** (tendencia amortiguada + estacionalidad aditiva),
+**ARIMA(p,d,q)** y **SARIMA(p,d,q)(P,D,Q)m**, con órdenes elegidos por AIC en el primer tramo de entrenamiento.
+Se validan con backtesting de origen móvil (4 semanas por corte) contra dos referencias simples (ingenuo y media
+móvil) usando MAE, RMSE y MAPE; en modo automático se usa el de menor MAPE.
 
 **Inventario.** Revisión continua: SS = Z·σ·√L, ROP = μ·L + SS, EOQ = √(2DS/H).
 

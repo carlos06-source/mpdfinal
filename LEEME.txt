@@ -35,6 +35,10 @@ B) CORRER EN LA COMPUTADORA (Windows)
 PARA LA PRESENTACIÓN
 -----------------------------------------------------------------
 - Desactivar el traductor de Chrome (mezcla comas y puntos).
+- Demanda -> pestaña "Demanda (series de tiempo)": descomposición, ADF, ACF/PACF,
+  Holt-Winters, ARIMA y SARIMA con MAE/RMSE/MAPE y pronóstico. En el panel lateral
+  se elige el índice temporal (diario/semanal) y la variable a proyectar.
+- La primera carga tarda unos 20-30 segundos (ajuste de los modelos).
 - Criterio 3 -> pestaña "Indicadores clave" (7 indicadores, técnica y gráfico).
 - Criterio 4 -> pestaña "Escenarios prescriptivos" (6 escenarios editables,
   restricciones y recomendación automática).
