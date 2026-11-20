@@ -1,0 +1,41 @@
+APP PIZZERÍA · Elasticidad + Demanda + Inventario (MPD · Grupo 2)
+=================================================================
+
+CONTENIDO
+  app.py                  -> la aplicación
+  requirements.txt        -> librerías que instala Streamlit Cloud
+  .streamlit/config.toml  -> colores del tema
+  (FALTA) pizza_sales_ordenado.csv -> copien aquí su CSV de datos con ESE nombre
+          Acepta separador ; o , y fechas día/mes/año.
+          Si no está, la app pide subirlo desde el panel lateral (📂 Datos).
+
+-----------------------------------------------------------------
+A) PUBLICAR EN LA PÁGINA (Streamlit Cloud)
+-----------------------------------------------------------------
+1. Entren a su repositorio en GitHub (cuenta 20232618-glitch).
+2. Add file -> Upload files -> arrastren app.py, requirements.txt
+   y pizza_sales_ordenado.csv (si no está ya) -> Commit changes.
+   La carpeta .streamlit se sube igual (arrastrar la carpeta completa).
+3. Esperen 1-2 minutos y recarguen la página.
+   Si no cambia: menú ⋮ (arriba a la derecha) -> Reboot app.
+
+   App nueva desde cero: share.streamlit.io -> Create app ->
+   elegir el repositorio, rama main, archivo principal: app.py -> Deploy.
+
+-----------------------------------------------------------------
+B) CORRER EN SU COMPUTADORA (Windows)
+-----------------------------------------------------------------
+1. Tener Python 3.10 o superior (python.org, marcar "Add to PATH").
+2. Abrir la carpeta app_pizzeria, escribir cmd en la barra de
+   direcciones y Enter.
+3. Ejecutar:
+      pip install -r requirements.txt
+      streamlit run app.py
+4. Se abre solo en el navegador (http://localhost:8501).
+
+-----------------------------------------------------------------
+PARA LA PRESENTACIÓN
+-----------------------------------------------------------------
+- Desactivar el traductor de Chrome en la página (mezcla comas y puntos).
+- Revisar: "Modelo de pronóstico" = Automático; con Δ precio 0 % todos
+  los indicadores marcan +0.0 % vs base.
